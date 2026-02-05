@@ -1,0 +1,9 @@
+pybullet==3.2.7
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+imageio>=2.34
+scikit-learn>=1.4
+scikit-image>=0.23
+torch
+osqp

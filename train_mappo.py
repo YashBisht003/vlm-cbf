@@ -1,0 +1,349 @@
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pybullet as p
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from gnn_policy import CentralCritic, GnnPolicy
+from marl_obs import build_observation, obs_dim
+from train_logger import TrainLogger
+from vlm_cbf_env import Phase, RobotAction, TaskConfig, VlmCbfEnv
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="MAPPO-style training (GNN policy, centralized critic)")
+    parser.add_argument("--updates", type=int, default=200, help="Number of PPO updates")
+    parser.add_argument("--steps-per-update", type=int, default=512, help="Rollout steps per update")
+    parser.add_argument("--epochs", type=int, default=5, help="PPO epochs per update")
+    parser.add_argument("--minibatch", type=int, default=32, help="Minibatch size (time steps)")
+    parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
+    parser.add_argument("--gae-lambda", type=float, default=0.95, help="GAE lambda")
+    parser.add_argument("--clip", type=float, default=0.2, help="PPO clip range")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
+    parser.add_argument("--entropy", type=float, default=0.01, help="Entropy coefficient")
+    parser.add_argument("--value-coef", type=float, default=0.5, help="Value loss coefficient")
+    parser.add_argument("--device", default="auto", help="cpu, cuda, or auto")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--headless", action="store_true", help="Run without GUI")
+    parser.add_argument("--out", default="mappo_policy.pt", help="Final checkpoint path")
+    parser.add_argument("--checkpoint-dir", default="checkpoints", help="Directory for periodic checkpoints")
+    parser.add_argument("--save-every", type=int, default=25, help="Checkpoint cadence (updates)")
+    parser.add_argument("--save-latest", action="store_true", help="Also save a rolling latest checkpoint")
+    parser.add_argument("--resume", action="store_true", help="Resume from latest/best checkpoint")
+    parser.add_argument("--resume-path", default="", help="Explicit checkpoint path to resume")
+    parser.add_argument("--resume-best", action="store_true", help="Resume from best checkpoint if available")
+    parser.add_argument(
+        "--best-metric",
+        choices=("success_rate", "mean_reward"),
+        default="success_rate",
+        help="Metric for best checkpoint tracking",
+    )
+    parser.add_argument("--max-steps", type=int, default=4000, help="Max steps per episode")
+    parser.add_argument("--log-csv", default="train_metrics.csv", help="CSV log output")
+    return parser.parse_args()
+
+
+def _select_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+def _to_actions(action: np.ndarray, env: VlmCbfEnv) -> Dict[int, RobotAction]:
+    actions: Dict[int, RobotAction] = {}
+    for idx, robot in enumerate(env.robots):
+        vx = float(action[idx, 0]) * env.cfg.speed_limit
+        vy = float(action[idx, 1]) * env.cfg.speed_limit
+        yaw_rate = float(action[idx, 2]) * env.cfg.yaw_rate_max
+        grip = bool(action[idx, 3] > 0.5)
+        actions[robot.base_id] = RobotAction(base_vel=(vx, vy, yaw_rate), grip=grip)
+    return actions
+
+
+def _mean_distance(points_a: List[np.ndarray], points_b: List[np.ndarray]) -> float:
+    if not points_a or not points_b:
+        return 0.0
+    dists = [float(np.linalg.norm(a[:2] - b[:2])) for a, b in zip(points_a, points_b)]
+    return float(np.mean(dists)) if dists else 0.0
+
+
+def _compute_reward(env: VlmCbfEnv, prev_viol: Dict[str, int]) -> Tuple[float, Dict[str, int]]:
+    obj_pos, _ = env._get_object_pose(noisy=False)
+    obj_pos = np.array(obj_pos, dtype=np.float32)
+    reward = -0.01
+
+    robot_positions = []
+    for robot in env.robots:
+        pos, _ = env._get_robot_pose(robot, noisy=False)
+        robot_positions.append(np.array(pos, dtype=np.float32))
+
+    if env.phase in (Phase.PLAN, Phase.APPROACH):
+        waypoints = [r.waypoint if r.waypoint is not None else pos for r, pos in zip(env.robots, robot_positions)]
+        reward -= _mean_distance(robot_positions, waypoints)
+    elif env.phase == Phase.CONTACT:
+        targets = [obj_pos for _ in robot_positions]
+        reward -= _mean_distance(robot_positions, targets)
+    elif env.phase == Phase.LIFT:
+        reward += float(env.current_lift) * 2.0
+    elif env.phase == Phase.TRANSPORT:
+        goal_dist = float(np.linalg.norm(obj_pos[:2] - env.goal_pos[:2]))
+        reward -= goal_dist
+    elif env.phase == Phase.PLACE:
+        reward -= abs(float(obj_pos[2]) - float(env.podium_height))
+    elif env.phase == Phase.DONE:
+        reward += 10.0
+
+    delta_speed = env.violations["speed"] - prev_viol.get("speed", 0)
+    delta_sep = env.violations["separation"] - prev_viol.get("separation", 0)
+    delta_force = env.violations["force"] - prev_viol.get("force", 0)
+    reward -= 0.05 * delta_speed + 0.1 * delta_sep + 0.1 * delta_force
+
+    return float(reward), dict(env.violations)
+
+
+def _compute_gae(rewards, values, dones, gamma, gae_lambda):
+    advantages = np.zeros_like(rewards, dtype=np.float32)
+    last_gae = 0.0
+    for t in reversed(range(len(rewards))):
+        next_value = values[t + 1] if t + 1 < len(values) else 0.0
+        mask = 1.0 - dones[t]
+        delta = rewards[t] + gamma * next_value * mask - values[t]
+        last_gae = delta + gamma * gae_lambda * mask * last_gae
+        advantages[t] = last_gae
+    returns = advantages + values
+    return advantages, returns
+
+
+def main() -> None:
+    args = _parse_args()
+    device = _select_device(args.device)
+    rng = np.random.default_rng(args.seed)
+    torch.manual_seed(args.seed or int(time.time()))
+
+    cfg = TaskConfig(gui=not args.headless, random_seed=args.seed)
+    env = VlmCbfEnv(cfg)
+
+    n_agents = len(env.robots)
+    policy = GnnPolicy(obs_dim(), hidden=128, msg_dim=128, layers=3).to(device)
+    critic = CentralCritic(obs_dim(), n_agents=n_agents).to(device)
+
+    policy_opt = optim.Adam(policy.parameters(), lr=args.lr)
+    critic_opt = optim.Adam(critic.parameters(), lr=args.lr)
+    logger = TrainLogger(args.log_csv)
+
+    checkpoint_path = Path(args.out)
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    start_update = 1
+    best_metric = -1e9
+
+    def _load_checkpoint(path: Path) -> None:
+        nonlocal start_update, best_metric
+        if not path.exists():
+            return
+        ckpt = torch.load(path, map_location=device)
+        policy.load_state_dict(ckpt["policy"])
+        critic.load_state_dict(ckpt["critic"])
+        if "policy_opt" in ckpt:
+            policy_opt.load_state_dict(ckpt["policy_opt"])
+        if "critic_opt" in ckpt:
+            critic_opt.load_state_dict(ckpt["critic_opt"])
+        start_update = int(ckpt.get("update", 0)) + 1
+        best_metric = float(ckpt.get("best_metric", best_metric))
+
+    if args.resume or args.resume_path or args.resume_best:
+        resume_path = None
+        if args.resume_path:
+            resume_path = Path(args.resume_path)
+        elif args.resume_best:
+            resume_path = checkpoint_dir / "mappo_policy_best.pt"
+        else:
+            resume_path = checkpoint_dir / "mappo_policy_latest.pt"
+        _load_checkpoint(resume_path)
+
+    for update in range(start_update, args.updates + 1):
+        env.reset()
+        rollout_obs = []
+        rollout_pos = []
+        rollout_pre = []
+        rollout_grip = []
+        rollout_logp = []
+        rollout_vals = []
+        rollout_rewards = []
+        rollout_dones = []
+        rollout_cbf_calls = 0
+        rollout_cbf_modified = 0
+        rollout_cbf_fallback = 0
+        rollout_cbf_force_stop = 0
+        episode_successes = 0
+        episode_count = 0
+        prev_viol = dict(env.violations)
+        steps = 0
+        episode_steps = 0
+
+        while steps < args.steps_per_update:
+            obs, pos = build_observation(env)
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+            pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
+            with torch.no_grad():
+                act_out = policy.act(obs_t, pos_t, deterministic=False)
+                value = critic(obs_t)
+
+            actions = _to_actions(act_out.action.cpu().numpy(), env)
+            _obs, info = env.step(actions)
+            reward, prev_viol = _compute_reward(env, prev_viol)
+            done = float(info["phase"] == "done")
+            cbf = info.get("cbf", {})
+            rollout_cbf_calls += int(cbf.get("calls", 0))
+            rollout_cbf_modified += int(cbf.get("modified", 0))
+            rollout_cbf_fallback += int(cbf.get("fallback", 0))
+            rollout_cbf_force_stop += int(cbf.get("force_stop", 0))
+
+            rollout_obs.append(obs)
+            rollout_pos.append(pos)
+            rollout_pre.append(act_out.pre_tanh.cpu().numpy())
+            rollout_grip.append(act_out.grip_action.cpu().numpy())
+            rollout_logp.append(act_out.logprob.cpu().numpy())
+            rollout_vals.append(float(value.cpu().item()))
+            rollout_rewards.append(reward)
+            rollout_dones.append(done)
+
+            steps += 1
+            episode_steps += 1
+            if done or episode_steps >= args.max_steps:
+                episode_count += 1
+                if done:
+                    episode_successes += 1
+                env.reset()
+                prev_viol = dict(env.violations)
+                episode_steps = 0
+
+        advantages, returns = _compute_gae(
+            np.array(rollout_rewards, dtype=np.float32),
+            np.array(rollout_vals, dtype=np.float32),
+            np.array(rollout_dones, dtype=np.float32),
+            args.gamma,
+            args.gae_lambda,
+        )
+        cbf_rate = rollout_cbf_modified / max(rollout_cbf_calls, 1)
+        success_rate = float(episode_successes / max(episode_count, 1))
+
+        obs_arr = np.stack(rollout_obs)  # (T, N, obs_dim)
+        pos_arr = np.stack(rollout_pos)
+        pre_arr = np.stack(rollout_pre)
+        grip_arr = np.stack(rollout_grip)
+        old_logp = np.stack(rollout_logp)
+
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
+        returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
+
+        time_indices = np.arange(obs_arr.shape[0])
+
+        for _epoch in range(args.epochs):
+            rng.shuffle(time_indices)
+            for start in range(0, len(time_indices), args.minibatch):
+                batch = time_indices[start : start + args.minibatch]
+                actor_loss = 0.0
+                entropy_loss = 0.0
+                for t in batch:
+                    obs_t = torch.tensor(obs_arr[t], dtype=torch.float32, device=device)
+                    pos_t = torch.tensor(pos_arr[t], dtype=torch.float32, device=device)
+                    pre_t = torch.tensor(pre_arr[t], dtype=torch.float32, device=device)
+                    grip_t = torch.tensor(grip_arr[t], dtype=torch.float32, device=device)
+                    old_logp_t = torch.tensor(old_logp[t], dtype=torch.float32, device=device)
+                    adv_t = torch.tensor(advantages[t], dtype=torch.float32, device=device)
+
+                    new_logp, entropy = policy.evaluate_actions(obs_t, pos_t, pre_t, grip_t)
+                    ratio = torch.exp(new_logp - old_logp_t)
+                    surr1 = ratio * adv_t
+                    surr2 = torch.clamp(ratio, 1.0 - args.clip, 1.0 + args.clip) * adv_t
+                    actor_loss = actor_loss + (-torch.min(surr1, surr2).mean() - args.entropy * entropy.mean())
+                    entropy_loss = entropy_loss + entropy.mean()
+
+                actor_loss = actor_loss / max(1, len(batch))
+                policy_opt.zero_grad()
+                actor_loss.backward()
+                nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+                policy_opt.step()
+
+            value_pred = []
+            for t in range(obs_arr.shape[0]):
+                obs_step = torch.tensor(obs_arr[t], dtype=torch.float32, device=device)
+                value_pred.append(critic(obs_step))
+            value_pred = torch.stack(value_pred).squeeze(-1)
+            value_loss = (returns_t - value_pred).pow(2).mean()
+
+            critic_opt.zero_grad()
+            value_loss.backward()
+            nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
+            critic_opt.step()
+
+        current_metric = float(episode_successes / max(episode_count, 1))
+        if args.best_metric == "mean_reward":
+            current_metric = float(np.mean(rollout_rewards))
+        if current_metric > best_metric:
+            best_metric = current_metric
+            best_ckpt = {
+                "policy": policy.state_dict(),
+                "critic": critic.state_dict(),
+                "policy_opt": policy_opt.state_dict(),
+                "critic_opt": critic_opt.state_dict(),
+                "obs_dim": obs_dim(),
+                "n_agents": n_agents,
+                "update": update,
+                "best_metric": best_metric,
+            }
+            torch.save(best_ckpt, checkpoint_dir / "mappo_policy_best.pt")
+
+        if update % args.save_every == 0 or update == args.updates:
+            checkpoint = {
+                "policy": policy.state_dict(),
+                "critic": critic.state_dict(),
+                "policy_opt": policy_opt.state_dict(),
+                "critic_opt": critic_opt.state_dict(),
+                "obs_dim": obs_dim(),
+                "n_agents": n_agents,
+                "update": update,
+                "best_metric": best_metric,
+            }
+            ckpt_path = checkpoint_dir / f"mappo_policy_update_{update:04d}.pt"
+            torch.save(checkpoint, ckpt_path)
+            if args.save_latest:
+                torch.save(checkpoint, checkpoint_dir / "mappo_policy_latest.pt")
+            if update == args.updates:
+                torch.save(checkpoint, checkpoint_path)
+
+        logger.write(
+            {
+                "update": update,
+                "mean_reward": float(np.mean(rollout_rewards)),
+                "value_loss": float(value_loss.item()),
+                "actor_loss": float(actor_loss.item()),
+                "episodes": float(episode_count),
+                "success_rate": success_rate,
+                "cbf_calls": float(rollout_cbf_calls),
+                "cbf_modified": float(rollout_cbf_modified),
+                "cbf_fallback": float(rollout_cbf_fallback),
+                "cbf_force_stop": float(rollout_cbf_force_stop),
+                "cbf_rate": float(cbf_rate),
+            }
+        )
+
+        print(
+            f"Update {update}/{args.updates} | mean reward {np.mean(rollout_rewards):.3f} | "
+            f"value loss {value_loss.item():.4f} | actor loss {actor_loss.item():.4f}"
+        )
+
+    env.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,28 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Datasets and generated media
+vlm_dataset/
+vlm_dataset_v2/
+vlm_dataset*/
+videos/
+screenshots/
+*.mp4
+*.png
+
+# Models and checkpoints
+cpu_vlm_model.joblib
+mappo_policy*.pt
+checkpoints/
+
+# Logs and metrics
+train_metrics.csv
+*.log
+*.err
+eval_results*.csv
+
+# OS / editor
+.DS_Store
+Thumbs.db

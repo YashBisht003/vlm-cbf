@@ -129,6 +129,7 @@ def main() -> None:
 
     cfg = TaskConfig(gui=not args.headless, random_seed=args.seed)
     env = VlmCbfEnv(cfg)
+    env.reset()
 
     n_agents = len(env.robots)
     policy = GnnPolicy(obs_dim(), hidden=128, msg_dim=128, layers=3).to(device)

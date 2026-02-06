@@ -91,13 +91,25 @@ def _parse_args() -> argparse.Namespace:
         "--phase-approach-timeout-s",
         type=float,
         default=20.0,
-        help="Approach timeout before quorum fallback (s)",
+        help="Approach timeout for optional quorum fallback (s)",
     )
     parser.add_argument(
         "--phase-approach-min-ready",
         type=int,
-        default=2,
-        help="Ready quorum for approach timeout fallback",
+        default=4,
+        help="Ready quorum count when quorum fallback is enabled",
+    )
+    parser.add_argument(
+        "--phase-allow-quorum-fallback",
+        dest="phase_allow_quorum_fallback",
+        action="store_true",
+        help="Allow timeout-based quorum fallback in approach phase",
+    )
+    parser.add_argument(
+        "--no-phase-allow-quorum-fallback",
+        dest="phase_allow_quorum_fallback",
+        action="store_false",
+        help="Disable timeout-based quorum fallback (strict consensus)",
     )
     parser.add_argument(
         "--udp-phase",
@@ -156,7 +168,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--screenshots-dir", default="screenshots", help="Output directory for screenshots")
     parser.add_argument("--screenshot-width", type=int, default=1280, help="Screenshot width")
     parser.add_argument("--screenshot-height", type=int, default=720, help="Screenshot height")
-    parser.set_defaults(udp_phase=True, udp_neighbor_state=True)
+    parser.set_defaults(udp_phase=True, udp_neighbor_state=True, phase_allow_quorum_fallback=False)
     return parser.parse_args()
 
 
@@ -274,6 +286,7 @@ def main() -> None:
         phase_approach_dist=args.phase_approach_dist,
         phase_approach_timeout_s=args.phase_approach_timeout_s,
         phase_approach_min_ready=args.phase_approach_min_ready,
+        phase_allow_quorum_fallback=args.phase_allow_quorum_fallback,
         use_udp_phase=args.udp_phase,
         use_udp_neighbor_state=args.udp_neighbor_state,
         udp_base_port=args.udp_base_port,

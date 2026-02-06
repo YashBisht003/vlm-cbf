@@ -213,7 +213,7 @@ the ISO speed norm bound.
 
 Neural force barrier integration (`h_phi([F_i, mu_b, Sigma_b])`):
 - The neural barrier is evaluated from force + EKF belief.
-- A linearized neural-CBF inequality is added to the same QP (`a^T v + s >= b`).
+- A linearized neural-CBF inequality is added to the same QP (`a^T v + s >= b`) using autograd `dh_phi/dv` at the current control point.
 - By default, extra neural speed/separation shaping is disabled (`neural_cbf_tighten_gain=0`, `neural_cbf_sigmoid_gain=0`) so the neural term enters primarily through the QP inequality.
 - Online neural-CBF training uses temporal rollout residuals plus safe/unsafe sign regularization, including unsafe transitions.
 
@@ -227,6 +227,8 @@ This keeps phase voting and neighbor-state exchange out of a centralized loop
 and logs phase sync delay metrics in `info["phase_sync"]`.
 Execution is decentralized but communication-enabled (lightweight P2P UDP),
 not communication-free.
+Default behavior is strict all-robot consensus; timeout quorum fallback is optional
+(`phase_allow_quorum_fallback=True`).
 
 ## Vacuum End Effector Model
 `carry_mode="constraint"` uses a vacuum-style fixed constraint per end effector.
@@ -308,8 +310,8 @@ If you change these settings, regenerate the dataset before training.
 - If no VLM output is provided, the environment still falls back to geometric formation.
 - Reproduce VLM claims from this repo using `train_vlm_llava_lora.py` + `eval_vlm_formations.py` on a fixed split.
 - The neural CBF currently uses a linearized inequality in QP with a local
-  dynamics surrogate; this is a practical implementation, not a full formal proof
-  pipeline for forward invariance.
+  dynamics surrogate and autograd gradient; this is a practical implementation,
+  not a full formal proof pipeline for forward invariance.
 - Online neural-CBF training is rollout-supervised from temporal safety
   residuals and safety constraints; for stronger claims, use a dedicated
   safe/unsafe dataset and ablation protocol.
@@ -317,8 +319,8 @@ If you change these settings, regenerate the dataset before training.
   kinematic carry if attachment does not stabilize within a short window.
 - `carry_mode="constraint"` is the most physically faithful, but may need tuning
   for very heavy payloads or noisy contacts.
-- The environment now includes approach timeout quorum fallback for phase progression
-  in difficult randomized layouts (`phase_approach_timeout_s`, `phase_approach_min_ready`).
+- Approach timeout quorum fallback is optional, disabled by default for strict
+  consensus transitions (`phase_allow_quorum_fallback=False`).
 - Formation assignment and phase progression are structured (VLM/Hungarian + consensus FSM);
   MAPPO learns cooperative low-level control within this scaffold, rather than the task graph itself.
 - This is an environment scaffold; it is ready to integrate with your policy.

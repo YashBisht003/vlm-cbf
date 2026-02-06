@@ -60,6 +60,14 @@ class NeuralCbfEval:
     features: np.ndarray
 
 
+@dataclass
+class NeuralCbfLinearization:
+    h_value: float
+    grad_v: np.ndarray
+    features: np.ndarray
+    force_n: float
+
+
 class NeuralCbfRuntime:
     def __init__(
         self,
@@ -78,14 +86,60 @@ class NeuralCbfRuntime:
         if model_path:
             self.load(model_path)
 
-    def eval_barrier(self, force_n: float, belief_mu: np.ndarray, belief_cov: np.ndarray) -> NeuralCbfEval:
-        features = build_neural_cbf_input(force_n=force_n, belief_mu=belief_mu, belief_cov=belief_cov)
+    def eval_barrier(
+        self,
+        force_n: float,
+        belief_mu: np.ndarray,
+        belief_cov: np.ndarray,
+    ) -> NeuralCbfEval:
+        features = build_neural_cbf_input(
+            force_n=force_n,
+            belief_mu=belief_mu,
+            belief_cov=belief_cov,
+        )
         if features.shape[0] != self.input_dim:
             raise ValueError(f"Neural CBF input dim mismatch: got {features.shape[0]}, expected {self.input_dim}")
         with torch.no_grad():
             x = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
             h_value = float(self.model(x).item())
         return NeuralCbfEval(h_value=h_value, features=features)
+
+    def linearized_velocity_constraint(
+        self,
+        force_n: float,
+        belief_mu: np.ndarray,
+        belief_cov: np.ndarray,
+        v_ref: np.ndarray,
+        obj_vel_xy: np.ndarray,
+        normal_xy: np.ndarray,
+        dt: float,
+        force_vel_gain: float,
+    ) -> NeuralCbfLinearization:
+        v_ref_t = torch.tensor(np.asarray(v_ref, dtype=np.float32).reshape(2), dtype=torch.float32, device=self.device)
+        v_ref_t.requires_grad_(True)
+        obj_vel_t = torch.tensor(np.asarray(obj_vel_xy, dtype=np.float32).reshape(2), dtype=torch.float32, device=self.device)
+        normal_t = torch.tensor(np.asarray(normal_xy, dtype=np.float32).reshape(2), dtype=torch.float32, device=self.device)
+        if float(torch.norm(normal_t).item()) < 1e-7:
+            normal_t = torch.tensor([1.0, 0.0], dtype=torch.float32, device=self.device)
+        force_n_t = torch.tensor(float(force_n), dtype=torch.float32, device=self.device)
+        approach_speed = torch.dot(v_ref_t - obj_vel_t, normal_t)
+        force_pred = torch.clamp(force_n_t + float(force_vel_gain * dt) * approach_speed, 0.0, 2.5)
+
+        mu_t = torch.tensor(np.asarray(belief_mu, dtype=np.float32).reshape(-1), dtype=torch.float32, device=self.device)
+        cov_t = torch.tensor(_cov_upper(np.asarray(belief_cov, dtype=np.float32)), dtype=torch.float32, device=self.device)
+
+        features = torch.cat([force_pred.view(1), mu_t, cov_t], dim=0)
+        if int(features.numel()) != self.input_dim:
+            raise ValueError(f"Neural CBF input dim mismatch: got {int(features.numel())}, expected {self.input_dim}")
+        h_value_t = self.model(features.unsqueeze(0)).squeeze(0).squeeze(0)
+        grad_v = torch.autograd.grad(h_value_t, v_ref_t, retain_graph=False, create_graph=False)[0]
+
+        return NeuralCbfLinearization(
+            h_value=float(h_value_t.detach().item()),
+            grad_v=grad_v.detach().cpu().numpy().astype(np.float32),
+            features=features.detach().cpu().numpy().astype(np.float32),
+            force_n=float(force_pred.detach().item()),
+        )
 
     def load(self, model_path: str) -> None:
         path = Path(model_path)

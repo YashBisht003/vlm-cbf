@@ -55,12 +55,35 @@ def _parse_args() -> argparse.Namespace:
         help="Base drive model (velocity is robust; wheel is full wheel dynamics)",
     )
     parser.add_argument("--phase-approach-dist", type=float, default=0.25, help="Approach ready distance (m)")
-    parser.add_argument("--phase-approach-timeout-s", type=float, default=20.0, help="Approach timeout (s)")
-    parser.add_argument("--phase-approach-min-ready", type=int, default=2, help="Approach timeout quorum")
+    parser.add_argument(
+        "--phase-approach-timeout-s",
+        type=float,
+        default=20.0,
+        help="Approach timeout for optional quorum fallback (s)",
+    )
+    parser.add_argument(
+        "--phase-approach-min-ready",
+        type=int,
+        default=4,
+        help="Ready quorum count when quorum fallback is enabled",
+    )
+    parser.add_argument(
+        "--phase-allow-quorum-fallback",
+        dest="phase_allow_quorum_fallback",
+        action="store_true",
+        help="Allow timeout-based quorum fallback in approach phase",
+    )
+    parser.add_argument(
+        "--no-phase-allow-quorum-fallback",
+        dest="phase_allow_quorum_fallback",
+        action="store_false",
+        help="Disable timeout-based quorum fallback (strict consensus)",
+    )
     parser.add_argument("--udp-base-port", type=int, default=39000, help="Base UDP port for robot peers")
     parser.add_argument("--no-neural-cbf", action="store_true", help="Disable neural force barrier in safety layer")
     parser.add_argument("--video", action="store_true", help="Record MP4 video")
     parser.add_argument("--video-path", default="policy_demo.mp4", help="Output MP4 path")
+    parser.set_defaults(phase_allow_quorum_fallback=False)
     return parser.parse_args()
 
 
@@ -103,6 +126,7 @@ def main() -> None:
         phase_approach_dist=args.phase_approach_dist,
         phase_approach_timeout_s=args.phase_approach_timeout_s,
         phase_approach_min_ready=args.phase_approach_min_ready,
+        phase_allow_quorum_fallback=args.phase_allow_quorum_fallback,
         udp_base_port=args.udp_base_port,
         use_neural_cbf=not args.no_neural_cbf,
     )

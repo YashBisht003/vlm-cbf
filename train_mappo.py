@@ -74,13 +74,25 @@ def _parse_args() -> argparse.Namespace:
         "--phase-approach-timeout-s",
         type=float,
         default=20.0,
-        help="Approach timeout before quorum fallback (s)",
+        help="Approach timeout for optional quorum fallback (s)",
     )
     parser.add_argument(
         "--phase-approach-min-ready",
         type=int,
-        default=2,
-        help="Ready quorum for approach timeout fallback",
+        default=4,
+        help="Ready quorum count when quorum fallback is enabled",
+    )
+    parser.add_argument(
+        "--phase-allow-quorum-fallback",
+        dest="phase_allow_quorum_fallback",
+        action="store_true",
+        help="Allow timeout-based quorum fallback in approach phase (default: disabled for strict consensus)",
+    )
+    parser.add_argument(
+        "--no-phase-allow-quorum-fallback",
+        dest="phase_allow_quorum_fallback",
+        action="store_false",
+        help="Disable timeout-based quorum fallback",
     )
     parser.add_argument(
         "--udp-phase",
@@ -127,7 +139,6 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--neural-cbf-hidden", type=int, default=64, help="Neural CBF hidden size")
     parser.add_argument("--neural-cbf-device", default="cpu", help="Device for neural CBF runtime")
     parser.add_argument("--neural-cbf-alpha", type=float, default=1.0, help="Alpha for neural CBF inequality")
-    parser.add_argument("--neural-cbf-fd-eps", type=float, default=1e-3, help="Finite diff epsilon for neural CBF")
     parser.add_argument(
         "--neural-cbf-force-vel-gain",
         type=float,
@@ -216,6 +227,7 @@ def _parse_args() -> argparse.Namespace:
         udp_phase=True,
         udp_neighbor_state=True,
         use_neural_cbf=True,
+        phase_allow_quorum_fallback=False,
     )
     return parser.parse_args()
 
@@ -403,6 +415,7 @@ def main() -> None:
         phase_approach_dist=args.phase_approach_dist,
         phase_approach_timeout_s=args.phase_approach_timeout_s,
         phase_approach_min_ready=args.phase_approach_min_ready,
+        phase_allow_quorum_fallback=args.phase_allow_quorum_fallback,
         use_udp_phase=args.udp_phase,
         use_udp_neighbor_state=args.udp_neighbor_state,
         udp_base_port=args.udp_base_port,
@@ -415,7 +428,6 @@ def main() -> None:
         neural_cbf_hidden=args.neural_cbf_hidden,
         neural_cbf_device=args.neural_cbf_device,
         neural_cbf_alpha=args.neural_cbf_alpha,
-        neural_cbf_fd_eps=args.neural_cbf_fd_eps,
         neural_cbf_force_vel_gain=args.neural_cbf_force_vel_gain,
         cbf_eps=args.cbf_epsilon,
     )

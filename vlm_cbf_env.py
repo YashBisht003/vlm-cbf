@@ -113,7 +113,6 @@ class TaskConfig:
     neural_cbf_tighten_gain: float = 0.0
     neural_cbf_sigmoid_gain: float = 0.0
     neural_cbf_alpha: float = 1.0
-    neural_cbf_fd_eps: float = 1e-3
     neural_cbf_force_vel_gain: float = 4.0
 
     use_udp_phase: bool = True
@@ -124,7 +123,8 @@ class TaskConfig:
     phase_consensus_window_s: float = 0.10
     phase_approach_dist: float = 0.25
     phase_approach_timeout_s: float = 20.0
-    phase_approach_min_ready: int = 2
+    phase_approach_min_ready: int = 4
+    phase_allow_quorum_fallback: bool = False
     phase_contact_force_threshold: float = 5.0
     phase_lift_stability_s: float = 1.0
     phase_lift_vertical_speed_max: float = 0.05
@@ -1117,11 +1117,6 @@ class VlmCbfEnv:
         extra_linear: List[Tuple[np.ndarray, float]] = []
         if self.cfg.use_neural_cbf and self.neural_cbf is not None:
             force_n0 = contact_force / max(self.cfg.contact_force_max, 1e-6)
-            neural_eval = self.neural_cbf.eval_barrier(force_n=force_n0, belief_mu=belief_mu, belief_cov=belief_cov)
-            neural_h = float(neural_eval.h_value) / max(eta_neural, 1e-3)
-            neural_h_ref = neural_h
-            neural_input = neural_eval.features
-
             obj_pos_world, _ = self._get_object_pose(noisy=False)
             obj_xy = np.array(obj_pos_world[:2], dtype=np.float32)
             rel = obj_xy - pos_i
@@ -1130,37 +1125,26 @@ class VlmCbfEnv:
                 normal_xy = rel / rel_norm
             else:
                 normal_xy = np.zeros(2, dtype=np.float32)
-
-            def _predict_force_n(v_xy: np.ndarray) -> float:
-                obj_vel_xy = np.asarray(belief_mu[3:5], dtype=np.float32)
-                rel_v = np.asarray(v_xy, dtype=np.float32) - obj_vel_xy
-                approach_speed = float(np.dot(rel_v, normal_xy))
-                force_next = force_n0 + self.cfg.neural_cbf_force_vel_gain * self.control_dt * approach_speed
-                return float(np.clip(force_next, 0.0, 2.5))
-
-            def _neural_h_for_velocity(v_xy: np.ndarray) -> float:
-                eval_out = self.neural_cbf.eval_barrier(
-                    force_n=_predict_force_n(v_xy),
-                    belief_mu=belief_mu,
-                    belief_cov=belief_cov,
-                )
-                return float(eval_out.h_value) / max(eta_neural, 1e-3)
+            obj_vel_xy = np.asarray(belief_mu[3:5], dtype=np.float32)
 
             v_ref = np.asarray(v_des, dtype=np.float32).reshape(2)
-            neural_h_ref = _neural_h_for_velocity(v_ref)
+            neural_lin = self.neural_cbf.linearized_velocity_constraint(
+                force_n=force_n0,
+                belief_mu=belief_mu,
+                belief_cov=belief_cov,
+                v_ref=v_ref,
+                obj_vel_xy=obj_vel_xy,
+                normal_xy=normal_xy,
+                dt=self.control_dt,
+                force_vel_gain=self.cfg.neural_cbf_force_vel_gain,
+            )
+            neural_h_ref = float(neural_lin.h_value) / max(eta_neural, 1e-3)
             neural_h = neural_h_ref
-
-            fd_eps = max(float(self.cfg.neural_cbf_fd_eps), 1e-5)
-            grad = np.zeros(2, dtype=np.float32)
-            for axis in range(2):
-                delta = np.zeros(2, dtype=np.float32)
-                delta[axis] = fd_eps
-                h_plus = _neural_h_for_velocity(v_ref + delta)
-                h_minus = _neural_h_for_velocity(v_ref - delta)
-                grad[axis] = (h_plus - h_minus) / (2.0 * fd_eps)
+            neural_input = neural_lin.features
+            grad = np.asarray(neural_lin.grad_v, dtype=np.float32) / max(eta_neural, 1e-3)
             grad_norm = float(np.linalg.norm(grad))
             if grad_norm > 1e-7:
-                rhs = float(np.dot(grad, v_ref) - (1.0 + self.cfg.neural_cbf_alpha) * neural_h_ref)
+                rhs = float(np.dot(grad, v_ref) - (self.cfg.neural_cbf_alpha * self.control_dt) * neural_h_ref)
                 extra_linear.append((grad.copy(), rhs))
 
             if self.cfg.neural_cbf_tighten_gain > 0.0:
@@ -1195,7 +1179,6 @@ class VlmCbfEnv:
                 normal_xy = rel / rel_norm
             else:
                 normal_xy = np.zeros(2, dtype=np.float32)
-            obj_vel_xy = np.asarray(belief_mu[3:5], dtype=np.float32)
             approach_speed_safe = float(np.dot(np.asarray(v_safe, dtype=np.float32) - obj_vel_xy, normal_xy))
             force_safe_n = float(
                 np.clip(
@@ -1663,7 +1646,8 @@ class VlmCbfEnv:
                 self.phase_time = 0.0
                 return
             if (
-                self.phase_time >= self.cfg.phase_approach_timeout_s
+                self.cfg.phase_allow_quorum_fallback
+                and self.phase_time >= self.cfg.phase_approach_timeout_s
                 and sum(local_ready.values()) >= self.cfg.phase_approach_min_ready
             ):
                 self.phase = Phase.CONTACT
@@ -1706,9 +1690,10 @@ class VlmCbfEnv:
 
         ready, delay = self._phase_consensus_ready()
         if not ready:
-            # Timeout fallback for approach deadlocks: proceed if quorum reached.
+            # Optional timeout fallback for difficult approach deadlocks.
             if (
-                self.phase == Phase.APPROACH
+                self.cfg.phase_allow_quorum_fallback
+                and self.phase == Phase.APPROACH
                 and self.phase_time >= self.cfg.phase_approach_timeout_s
                 and self._phase_ready_count() >= self.cfg.phase_approach_min_ready
             ):
@@ -1752,11 +1737,11 @@ class VlmCbfEnv:
         dims = self.object_spec.dims
         vlm_out = self._vlm_json_formation()
         if vlm_out is None:
-            waypoints, load_labels, conf = self._vlm_stub_formation(dims)
+            waypoints, load_labels = self._geometric_fallback(dims)
         else:
             waypoints, load_labels, conf = vlm_out
-        if conf < self.cfg.vlm_confidence_threshold:
-            waypoints, load_labels = self._geometric_fallback(dims)
+            if conf < self.cfg.vlm_confidence_threshold:
+                waypoints, load_labels = self._geometric_fallback(dims)
         world_waypoints = self._to_world_waypoints(obj_pos, obj_quat, waypoints)
         assignment = self._assign_robots(world_waypoints, load_labels)
         obj_center = np.array(obj_pos)
@@ -1859,18 +1844,6 @@ class VlmCbfEnv:
         points = points[:4]
         labels = (labels + ["low"] * 4)[:4]
         return points, labels, confidence
-
-    def _vlm_stub_formation(self, dims: Tuple[float, float, float]) -> Tuple[List[Tuple[float, float]], List[str], float]:
-        length, width, _ = dims
-        points = [
-            (length * 0.5, 0.0),
-            (-length * 0.5, 0.0),
-            (0.0, width * 0.5),
-            (0.0, -width * 0.5),
-        ]
-        load_labels = ["high", "high", "low", "low"]
-        confidence = float(self.rng.uniform(0.4, 0.9))
-        return points, load_labels, confidence
 
     def _geometric_fallback(self, dims: Tuple[float, float, float]) -> Tuple[List[Tuple[float, float]], List[str]]:
         length, width, _ = dims

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import random
+import re
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pybullet as p
@@ -19,7 +21,7 @@ from vlm_cbf_env import Phase, RobotAction, TaskConfig, VlmCbfEnv
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MAPPO-style training (GNN policy, centralized critic)")
-    parser.add_argument("--updates", type=int, default=200, help="Number of PPO updates")
+    parser.add_argument("--updates", type=int, default=1600, help="Number of PPO updates")
     parser.add_argument("--steps-per-update", type=int, default=512, help="Rollout steps per update")
     parser.add_argument("--epochs", type=int, default=5, help="PPO epochs per update")
     parser.add_argument("--minibatch", type=int, default=32, help="Minibatch size (time steps)")
@@ -31,11 +33,51 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--value-coef", type=float, default=0.5, help="Value loss coefficient")
     parser.add_argument("--device", default="auto", help="cpu, cuda, or auto")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--torch-threads", type=int, default=0, help="Torch CPU threads (0 = default)")
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
+    parser.add_argument(
+        "--carry-mode",
+        choices=("auto", "constraint", "kinematic"),
+        default="auto",
+        help="Object carry mode in environment",
+    )
+    parser.add_argument(
+        "--robot-size-mode",
+        choices=("base", "full"),
+        default="base",
+        help="Robot size reference mode for object scaling",
+    )
+    parser.add_argument("--size-ratio-min", type=float, default=1.0, help="Min object size ratio to robot")
+    parser.add_argument("--size-ratio-max", type=float, default=3.0, help="Max object size ratio to robot")
+    parser.add_argument(
+        "--constraint-force-scale",
+        type=float,
+        default=1.5,
+        help="Vacuum constraint force scale against robot payload (x payload*9.81)",
+    )
+    parser.add_argument("--vacuum-attach-dist", type=float, default=0.1, help="Vacuum attach distance (m)")
+    parser.add_argument("--vacuum-break-dist", type=float, default=0.2, help="Vacuum break distance (m)")
+    parser.add_argument(
+        "--vacuum-force-margin",
+        type=float,
+        default=1.05,
+        help="Required force margin multiplier vs object weight",
+    )
     parser.add_argument("--out", default="mappo_policy.pt", help="Final checkpoint path")
     parser.add_argument("--checkpoint-dir", default="checkpoints", help="Directory for periodic checkpoints")
     parser.add_argument("--save-every", type=int, default=25, help="Checkpoint cadence (updates)")
-    parser.add_argument("--save-latest", action="store_true", help="Also save a rolling latest checkpoint")
+    parser.add_argument(
+        "--save-latest",
+        dest="save_latest",
+        action="store_true",
+        help="Save a rolling latest checkpoint each update (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-save-latest",
+        dest="save_latest",
+        action="store_false",
+        help="Disable rolling latest checkpoint",
+    )
     parser.add_argument("--resume", action="store_true", help="Resume from latest/best checkpoint")
     parser.add_argument("--resume-path", default="", help="Explicit checkpoint path to resume")
     parser.add_argument("--resume-best", action="store_true", help="Resume from best checkpoint if available")
@@ -45,8 +87,22 @@ def _parse_args() -> argparse.Namespace:
         default="success_rate",
         help="Metric for best checkpoint tracking",
     )
+    parser.add_argument("--log-interval", type=int, default=10, help="Print status every N updates")
+    parser.add_argument(
+        "--verify-checkpoints",
+        dest="verify_checkpoints",
+        action="store_true",
+        help="Load and validate checkpoints right after saving (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-verify-checkpoints",
+        dest="verify_checkpoints",
+        action="store_false",
+        help="Disable checkpoint load-back verification",
+    )
     parser.add_argument("--max-steps", type=int, default=4000, help="Max steps per episode")
     parser.add_argument("--log-csv", default="train_metrics.csv", help="CSV log output")
+    parser.set_defaults(save_latest=True, verify_checkpoints=True)
     return parser.parse_args()
 
 
@@ -121,13 +177,77 @@ def _compute_gae(rewards, values, dones, gamma, gae_lambda):
     return advantages, returns
 
 
+def _atomic_torch_save(payload: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(path)
+
+
+def _latest_update_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    latest_path: Optional[Path] = None
+    latest_update = -1
+    for path in checkpoint_dir.glob("mappo_policy_update_*.pt"):
+        match = re.search(r"mappo_policy_update_(\d+)\.pt$", path.name)
+        if not match:
+            continue
+        update_id = int(match.group(1))
+        if update_id > latest_update:
+            latest_update = update_id
+            latest_path = path
+    return latest_path
+
+
+def _verify_checkpoint(path: Path, expected_update: int) -> None:
+    if not path.exists():
+        raise RuntimeError(f"Checkpoint verification failed: missing file {path}")
+    try:
+        payload = torch.load(path, map_location="cpu")
+    except Exception as exc:
+        raise RuntimeError(f"Checkpoint verification failed while loading {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Checkpoint verification failed: payload is not a dict in {path}")
+    required = ("policy", "critic", "update", "best_metric")
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise RuntimeError(f"Checkpoint verification failed: missing keys {missing} in {path}")
+    saved_update = int(payload.get("update", -1))
+    if saved_update != int(expected_update):
+        raise RuntimeError(
+            f"Checkpoint verification failed: expected update {expected_update}, got {saved_update} in {path}"
+        )
+
+
 def main() -> None:
     args = _parse_args()
+    if args.updates <= 0:
+        raise ValueError("--updates must be > 0")
+    if args.steps_per_update <= 0:
+        raise ValueError("--steps-per-update must be > 0")
+    if args.save_every <= 0:
+        raise ValueError("--save-every must be > 0")
     device = _select_device(args.device)
-    rng = np.random.default_rng(args.seed)
-    torch.manual_seed(args.seed or int(time.time()))
+    if args.torch_threads > 0:
+        torch.set_num_threads(args.torch_threads)
+    seed = args.seed if args.seed is not None else int(time.time())
+    rng = np.random.default_rng(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    cfg = TaskConfig(gui=not args.headless, random_seed=args.seed)
+    cfg = TaskConfig(
+        gui=not args.headless,
+        random_seed=args.seed,
+        carry_mode=args.carry_mode,
+        robot_size_mode=args.robot_size_mode,
+        object_size_ratio=(args.size_ratio_min, args.size_ratio_max),
+        constraint_force_scale=args.constraint_force_scale,
+        vacuum_attach_dist=args.vacuum_attach_dist,
+        vacuum_break_dist=args.vacuum_break_dist,
+        vacuum_force_margin=args.vacuum_force_margin,
+    )
     env = VlmCbfEnv(cfg)
     env.reset()
 
@@ -146,10 +266,11 @@ def main() -> None:
     start_update = 1
     best_metric = -1e9
 
-    def _load_checkpoint(path: Path) -> None:
+    def _load_checkpoint(path: Path) -> bool:
         nonlocal start_update, best_metric
         if not path.exists():
-            return
+            print(f"Checkpoint not found: {path}")
+            return False
         ckpt = torch.load(path, map_location=device)
         policy.load_state_dict(ckpt["policy"])
         critic.load_state_dict(ckpt["critic"])
@@ -159,18 +280,44 @@ def main() -> None:
             critic_opt.load_state_dict(ckpt["critic_opt"])
         start_update = int(ckpt.get("update", 0)) + 1
         best_metric = float(ckpt.get("best_metric", best_metric))
+        print(f"Resumed from: {path} (next update {start_update})")
+        return True
 
     if args.resume or args.resume_path or args.resume_best:
-        resume_path = None
+        resume_candidates: List[Path] = []
         if args.resume_path:
-            resume_path = Path(args.resume_path)
+            resume_candidates.append(Path(args.resume_path))
         elif args.resume_best:
-            resume_path = checkpoint_dir / "mappo_policy_best.pt"
+            resume_candidates.append(checkpoint_dir / "mappo_policy_best.pt")
         else:
-            resume_path = checkpoint_dir / "mappo_policy_latest.pt"
-        _load_checkpoint(resume_path)
+            resume_candidates.append(checkpoint_dir / "mappo_policy_latest.pt")
+            latest_update_ckpt = _latest_update_checkpoint(checkpoint_dir)
+            if latest_update_ckpt is not None:
+                resume_candidates.append(latest_update_ckpt)
+            resume_candidates.append(checkpoint_path)
+
+        loaded = False
+        seen = set()
+        for candidate in resume_candidates:
+            key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            loaded = _load_checkpoint(candidate)
+            if loaded:
+                break
+        if not loaded:
+            print("Resume requested but no checkpoint was loaded; starting from update 1.")
+
+    if start_update > args.updates:
+        print(
+            f"Checkpoint update already reached target: start_update={start_update}, updates={args.updates}. Nothing to run."
+        )
+        env.close()
+        return
 
     for update in range(start_update, args.updates + 1):
+        update_start_t = time.time()
         env.reset()
         rollout_obs = []
         rollout_pos = []
@@ -245,8 +392,14 @@ def main() -> None:
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
         returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
+        adv_t_all = torch.tensor(advantages, dtype=torch.float32, device=device)
 
         time_indices = np.arange(obs_arr.shape[0])
+        obs_tensor = torch.tensor(obs_arr, dtype=torch.float32, device=device)
+        pos_tensor = torch.tensor(pos_arr, dtype=torch.float32, device=device)
+        pre_tensor = torch.tensor(pre_arr, dtype=torch.float32, device=device)
+        grip_tensor = torch.tensor(grip_arr, dtype=torch.float32, device=device)
+        old_logp_tensor = torch.tensor(old_logp, dtype=torch.float32, device=device)
 
         for _epoch in range(args.epochs):
             rng.shuffle(time_indices)
@@ -255,12 +408,12 @@ def main() -> None:
                 actor_loss = 0.0
                 entropy_loss = 0.0
                 for t in batch:
-                    obs_t = torch.tensor(obs_arr[t], dtype=torch.float32, device=device)
-                    pos_t = torch.tensor(pos_arr[t], dtype=torch.float32, device=device)
-                    pre_t = torch.tensor(pre_arr[t], dtype=torch.float32, device=device)
-                    grip_t = torch.tensor(grip_arr[t], dtype=torch.float32, device=device)
-                    old_logp_t = torch.tensor(old_logp[t], dtype=torch.float32, device=device)
-                    adv_t = torch.tensor(advantages[t], dtype=torch.float32, device=device)
+                    obs_t = obs_tensor[t]
+                    pos_t = pos_tensor[t]
+                    pre_t = pre_tensor[t]
+                    grip_t = grip_tensor[t]
+                    old_logp_t = old_logp_tensor[t]
+                    adv_t = adv_t_all[t]
 
                     new_logp, entropy = policy.evaluate_actions(obs_t, pos_t, pre_t, grip_t)
                     ratio = torch.exp(new_logp - old_logp_t)
@@ -275,11 +428,7 @@ def main() -> None:
                 nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
                 policy_opt.step()
 
-            value_pred = []
-            for t in range(obs_arr.shape[0]):
-                obs_step = torch.tensor(obs_arr[t], dtype=torch.float32, device=device)
-                value_pred.append(critic(obs_step))
-            value_pred = torch.stack(value_pred).squeeze(-1)
+            value_pred = critic(obs_tensor)
             value_loss = (returns_t - value_pred).pow(2).mean()
 
             critic_opt.zero_grad()
@@ -302,25 +451,34 @@ def main() -> None:
                 "update": update,
                 "best_metric": best_metric,
             }
-            torch.save(best_ckpt, checkpoint_dir / "mappo_policy_best.pt")
+            _atomic_torch_save(best_ckpt, checkpoint_dir / "mappo_policy_best.pt")
+            if args.verify_checkpoints:
+                _verify_checkpoint(checkpoint_dir / "mappo_policy_best.pt", update)
 
+        checkpoint = {
+            "policy": policy.state_dict(),
+            "critic": critic.state_dict(),
+            "policy_opt": policy_opt.state_dict(),
+            "critic_opt": critic_opt.state_dict(),
+            "obs_dim": obs_dim(),
+            "n_agents": n_agents,
+            "update": update,
+            "best_metric": best_metric,
+        }
+        if args.save_latest:
+            _atomic_torch_save(checkpoint, checkpoint_dir / "mappo_policy_latest.pt")
+            # Avoid expensive load-back every update; verify latest at periodic boundaries.
+            if args.verify_checkpoints and (update % args.save_every == 0 or update == args.updates):
+                _verify_checkpoint(checkpoint_dir / "mappo_policy_latest.pt", update)
         if update % args.save_every == 0 or update == args.updates:
-            checkpoint = {
-                "policy": policy.state_dict(),
-                "critic": critic.state_dict(),
-                "policy_opt": policy_opt.state_dict(),
-                "critic_opt": critic_opt.state_dict(),
-                "obs_dim": obs_dim(),
-                "n_agents": n_agents,
-                "update": update,
-                "best_metric": best_metric,
-            }
             ckpt_path = checkpoint_dir / f"mappo_policy_update_{update:04d}.pt"
-            torch.save(checkpoint, ckpt_path)
-            if args.save_latest:
-                torch.save(checkpoint, checkpoint_dir / "mappo_policy_latest.pt")
+            _atomic_torch_save(checkpoint, ckpt_path)
+            if args.verify_checkpoints:
+                _verify_checkpoint(ckpt_path, update)
             if update == args.updates:
-                torch.save(checkpoint, checkpoint_path)
+                _atomic_torch_save(checkpoint, checkpoint_path)
+                if args.verify_checkpoints:
+                    _verify_checkpoint(checkpoint_path, update)
 
         logger.write(
             {
@@ -328,6 +486,7 @@ def main() -> None:
                 "mean_reward": float(np.mean(rollout_rewards)),
                 "value_loss": float(value_loss.item()),
                 "actor_loss": float(actor_loss.item()),
+                "entropy": float(entropy_loss.item()) if hasattr(entropy_loss, "item") else float(entropy_loss),
                 "episodes": float(episode_count),
                 "success_rate": success_rate,
                 "cbf_calls": float(rollout_cbf_calls),
@@ -335,13 +494,16 @@ def main() -> None:
                 "cbf_fallback": float(rollout_cbf_fallback),
                 "cbf_force_stop": float(rollout_cbf_force_stop),
                 "cbf_rate": float(cbf_rate),
+                "update_sec": float(time.time() - update_start_t),
             }
         )
 
-        print(
-            f"Update {update}/{args.updates} | mean reward {np.mean(rollout_rewards):.3f} | "
-            f"value loss {value_loss.item():.4f} | actor loss {actor_loss.item():.4f}"
-        )
+        if update == start_update or update % max(1, args.log_interval) == 0 or update == args.updates:
+            print(
+                f"Update {update}/{args.updates} | mean reward {np.mean(rollout_rewards):.3f} | "
+                f"value loss {value_loss.item():.4f} | actor loss {actor_loss.item():.4f} | "
+                f"cbf rate {cbf_rate:.3f} | {time.time() - update_start_t:.2f}s/update"
+            )
 
     env.close()
 

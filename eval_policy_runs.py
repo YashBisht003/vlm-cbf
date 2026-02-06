@@ -1,15 +1,22 @@
+from __future__ import annotations
+
 import argparse
 import csv
 from collections import defaultdict
 from pathlib import Path
 
-import pybullet as p
+import torch
 
-from vlm_cbf_env import TaskConfig, VlmCbfEnv
+from gnn_policy import GnnPolicy
+from marl_obs import build_observation, obs_dim
+from vlm_cbf_env import RobotAction, TaskConfig, VlmCbfEnv
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate VLM-CBF PyBullet environment")
+    parser = argparse.ArgumentParser(description="Evaluate trained MAPPO policy over many episodes")
+    parser.add_argument("--model", required=True, help="Policy checkpoint path")
+    parser.add_argument("--device", default="auto", help="cpu, cuda, or auto")
+    parser.add_argument("--deterministic", action="store_true", help="Use deterministic policy actions")
     parser.add_argument("--episodes", type=int, default=20, help="Number of episodes")
     parser.add_argument("--max-steps", type=int, default=4000, help="Max steps per episode")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
@@ -21,14 +28,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-cbf", action="store_true", help="Disable CBF/QP safety filter")
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
-    parser.add_argument("--out", default="eval_results.csv", help="CSV output path")
-    parser.add_argument(
-        "--video-every",
-        type=int,
-        default=0,
-        help="Record an MP4 every N episodes (0 = disabled)",
-    )
-    parser.add_argument("--video-dir", default="videos", help="Output directory for MP4 files")
+    parser.add_argument("--out", default="eval_policy_results.csv", help="CSV output path")
 
     parser.add_argument("--pos-noise", type=float, default=0.0, help="Position noise std (m)")
     parser.add_argument("--yaw-noise", type=float, default=0.0, help="Yaw noise std (rad)")
@@ -88,7 +88,24 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _run_episode(env: VlmCbfEnv, max_steps: int) -> dict:
+def _select_device(name: str) -> torch.device:
+    if name == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+def _to_actions(action, env: VlmCbfEnv):
+    actions = {}
+    for idx, robot in enumerate(env.robots):
+        vx = float(action[idx, 0]) * env.cfg.speed_limit
+        vy = float(action[idx, 1]) * env.cfg.speed_limit
+        yaw_rate = float(action[idx, 2]) * env.cfg.yaw_rate_max
+        grip = bool(action[idx, 3] > 0.5)
+        actions[robot.base_id] = RobotAction(base_vel=(vx, vy, yaw_rate), grip=grip)
+    return actions
+
+
+def _run_episode(env: VlmCbfEnv, policy: GnnPolicy, device: torch.device, deterministic: bool, max_steps: int) -> dict:
     env.reset()
     phase_times = defaultdict(float)
     prev_phase = env.phase.value
@@ -96,7 +113,13 @@ def _run_episode(env: VlmCbfEnv, max_steps: int) -> dict:
     steps = 0
     info = {"phase": prev_phase, "time": 0.0, "violations": {}}
     while steps < max_steps:
-        _obs, info = env.step()
+        obs, pos = build_observation(env)
+        obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+        pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            act_out = policy.act(obs_t, pos_t, deterministic=deterministic)
+        actions = _to_actions(act_out.action.cpu().numpy(), env)
+        _obs, info = env.step(actions)
         steps += 1
         if info["phase"] != prev_phase:
             phase_times[prev_phase] += info["time"] - prev_time
@@ -133,6 +156,17 @@ def _run_episode(env: VlmCbfEnv, max_steps: int) -> dict:
 
 def main() -> None:
     args = _parse_args()
+    device = _select_device(args.device)
+    model_path = Path(args.model)
+    if not model_path.exists():
+        raise FileNotFoundError(model_path)
+
+    ckpt = torch.load(model_path, map_location=device)
+    state_dict = ckpt["policy"] if isinstance(ckpt, dict) and "policy" in ckpt else ckpt
+    policy = GnnPolicy(obs_dim(), hidden=128, msg_dim=128, layers=3).to(device)
+    policy.load_state_dict(state_dict)
+    policy.eval()
+
     cfg = TaskConfig(
         gui=not args.headless,
         random_seed=args.seed,
@@ -161,20 +195,8 @@ def main() -> None:
     env = VlmCbfEnv(cfg)
     results = []
     try:
-        video_dir = Path(args.video_dir)
-        if args.video_every and not cfg.gui:
-            print("Warning: video logging works best with GUI; continuing anyway.")
-        if args.video_every:
-            video_dir.mkdir(parents=True, exist_ok=True)
-
-        for ep in range(args.episodes):
-            log_id = None
-            if args.video_every and ep % args.video_every == 0:
-                video_path = video_dir / f"episode_{ep:04d}.mp4"
-                log_id = p.startStateLogging(p.STATE_LOGGING_VIDEO_MP4, str(video_path))
-            results.append(_run_episode(env, args.max_steps))
-            if log_id is not None:
-                p.stopStateLogging(log_id)
+        for _ep in range(args.episodes):
+            results.append(_run_episode(env, policy, device, args.deterministic, args.max_steps))
     finally:
         env.close()
 
@@ -250,11 +272,7 @@ def main() -> None:
         "overload_drop": sum(r.get("grasp", {}).get("overload_drop", 0) for r in results),
         "stretch_drop": sum(r.get("grasp", {}).get("stretch_drop", 0) for r in results),
     }
-    cbf_rate = (
-        cbf_total["modified"] / max(cbf_total["calls"], 1)
-        if cbf_total["calls"] > 0
-        else 0.0
-    )
+    cbf_rate = cbf_total["modified"] / max(cbf_total["calls"], 1)
     grasp_attach_rate = grasp_total["attach_success"] / max(grasp_total["attach_attempts"], 1)
 
     print(f"Saved: {out_path}")

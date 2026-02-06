@@ -20,6 +20,34 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=0, help="Max steps (0 = until done)")
     parser.add_argument("--deterministic", action="store_true", help="Use deterministic actions")
     parser.add_argument("--no-sleep", action="store_true", help="Run as fast as possible")
+    parser.add_argument(
+        "--carry-mode",
+        choices=("auto", "constraint", "kinematic"),
+        default="auto",
+        help="Object carry mode in environment",
+    )
+    parser.add_argument(
+        "--robot-size-mode",
+        choices=("base", "full"),
+        default="base",
+        help="Robot size reference mode for object scaling",
+    )
+    parser.add_argument("--size-ratio-min", type=float, default=1.0, help="Min object size ratio to robot")
+    parser.add_argument("--size-ratio-max", type=float, default=3.0, help="Max object size ratio to robot")
+    parser.add_argument(
+        "--constraint-force-scale",
+        type=float,
+        default=1.5,
+        help="Vacuum constraint force scale against payload",
+    )
+    parser.add_argument("--vacuum-attach-dist", type=float, default=0.1, help="Vacuum attach distance (m)")
+    parser.add_argument("--vacuum-break-dist", type=float, default=0.2, help="Vacuum break distance (m)")
+    parser.add_argument(
+        "--vacuum-force-margin",
+        type=float,
+        default=1.05,
+        help="Required force margin multiplier vs object weight",
+    )
     parser.add_argument("--video", action="store_true", help="Record MP4 video")
     parser.add_argument("--video-path", default="policy_demo.mp4", help="Output MP4 path")
     return parser.parse_args()
@@ -51,7 +79,16 @@ def main() -> None:
     policy.load_state_dict(ckpt["policy"])
     policy.eval()
 
-    cfg = TaskConfig(gui=not args.headless)
+    cfg = TaskConfig(
+        gui=not args.headless,
+        carry_mode=args.carry_mode,
+        robot_size_mode=args.robot_size_mode,
+        object_size_ratio=(args.size_ratio_min, args.size_ratio_max),
+        constraint_force_scale=args.constraint_force_scale,
+        vacuum_attach_dist=args.vacuum_attach_dist,
+        vacuum_break_dist=args.vacuum_break_dist,
+        vacuum_force_margin=args.vacuum_force_margin,
+    )
     env = VlmCbfEnv(cfg)
     env.reset()
 

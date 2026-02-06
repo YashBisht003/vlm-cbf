@@ -68,7 +68,10 @@ class TaskConfig:
     kinematic_base: bool = False
     carry_mode: str = "auto"  # auto, constraint, or kinematic
     constraint_fallback_time: float = 2.0
-    constraint_force_scale: float = 15.0
+    constraint_force_scale: float = 1.5
+    vacuum_attach_dist: float = 0.1
+    vacuum_break_dist: float = 0.2
+    vacuum_force_margin: float = 1.05
 
     yaw_rate_max: float = 1.2
     diff_heading_k: float = 2.5
@@ -212,6 +215,13 @@ class VlmCbfEnv:
         self.goal_waypoints: Optional[List[np.ndarray]] = None
         self.violations: Dict[str, int] = {"speed": 0, "separation": 0, "force": 0}
         self.cbf_stats: Dict[str, int] = {"calls": 0, "modified": 0, "fallback": 0, "force_stop": 0}
+        self.grasp_stats: Dict[str, int] = {
+            "attach_attempts": 0,
+            "attach_success": 0,
+            "detach_events": 0,
+            "overload_drop": 0,
+            "stretch_drop": 0,
+        }
         if self.cfg.carry_mode == "auto":
             self.active_carry_mode = "constraint"
         else:
@@ -259,6 +269,7 @@ class VlmCbfEnv:
             "violations": dict(self.violations),
             "carry_mode": self.active_carry_mode,
             "cbf": dict(self.cbf_stats),
+            "grasp": dict(self.grasp_stats),
         }
         return obs, info
 
@@ -963,28 +974,45 @@ class VlmCbfEnv:
             return
         if self.active_carry_mode != "constraint":
             return
-        ee_pos = self._end_effector_pos(robot)
-        obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
-        if np.linalg.norm(np.array(ee_pos) - np.array(obj_pos)) <= self.cfg.contact_dist:
-            robot.constraint_id = p.createConstraint(
-                robot.arm_id,
-                robot.end_effector_link,
-                self.object_id,
-                -1,
-                p.JOINT_FIXED,
-                [0, 0, 0],
-                [0, 0, 0],
-                [0, 0, 0],
-                physicsClientId=self.client_id,
-            )
-            max_force = max(500.0, robot.spec.payload * self.cfg.constraint_force_scale)
-            p.changeConstraint(robot.constraint_id, maxForce=max_force)
+        self.grasp_stats["attach_attempts"] += 1
+        attach_dist = max(self.cfg.contact_dist, self.cfg.vacuum_attach_dist)
+        closest = p.getClosestPoints(
+            bodyA=robot.arm_id,
+            bodyB=self.object_id,
+            distance=attach_dist,
+            linkIndexA=robot.end_effector_link,
+            physicsClientId=self.client_id,
+        )
+        if not closest:
+            return
+        robot.constraint_id = p.createConstraint(
+            robot.arm_id,
+            robot.end_effector_link,
+            self.object_id,
+            -1,
+            p.JOINT_FIXED,
+            [0, 0, 0],
+            [0, 0, 0],
+            [0, 0, 0],
+            physicsClientId=self.client_id,
+        )
+        max_force = self._constraint_force_capacity(robot)
+        p.changeConstraint(robot.constraint_id, maxForce=max_force)
+        self.grasp_stats["attach_success"] += 1
 
-    def _maybe_detach(self, robot: RobotInstance) -> None:
+    def _maybe_detach(self, robot: RobotInstance, reason: str = "release") -> None:
         if robot.constraint_id is None:
             return
         p.removeConstraint(robot.constraint_id, physicsClientId=self.client_id)
         robot.constraint_id = None
+        self.grasp_stats["detach_events"] += 1
+        if reason == "stretch":
+            self.grasp_stats["stretch_drop"] += 1
+        elif reason == "overload":
+            self.grasp_stats["overload_drop"] += 1
+
+    def _constraint_force_capacity(self, robot: RobotInstance) -> float:
+        return max(300.0, robot.spec.payload * 9.81 * self.cfg.constraint_force_scale)
 
     def _end_effector_pos(self, robot: RobotInstance) -> Tuple[float, float, float]:
         if robot.end_effector_link < 0:
@@ -1023,6 +1051,7 @@ class VlmCbfEnv:
         self._maybe_fallback_carry_mode()
         self._carry_object_if_needed()
         self._check_contact_forces()
+        self._enforce_vacuum_limits()
 
     def _check_contact_forces(self) -> None:
         if self.object_id is None:
@@ -1053,10 +1082,40 @@ class VlmCbfEnv:
             return
         if self.phase_time >= self.cfg.constraint_fallback_time:
             for robot in self.robots:
-                if robot.constraint_id is not None:
-                    p.removeConstraint(robot.constraint_id, physicsClientId=self.client_id)
-                    robot.constraint_id = None
+                self._maybe_detach(robot, reason="release")
             self.active_carry_mode = "kinematic"
+
+    def _enforce_vacuum_limits(self) -> None:
+        if self.object_id is None:
+            return
+        if self.active_carry_mode != "constraint":
+            return
+        attached = [robot for robot in self.robots if robot.constraint_id is not None]
+        if not attached:
+            return
+
+        obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
+        obj_pos = np.array(obj_pos, dtype=np.float32)
+        break_dist = max(self.cfg.contact_dist * 1.5, self.cfg.vacuum_break_dist)
+        for robot in list(attached):
+            ee_pos = np.array(self._end_effector_pos(robot), dtype=np.float32)
+            if float(np.linalg.norm(ee_pos - obj_pos)) > break_dist:
+                self._maybe_detach(robot, reason="stretch")
+
+        attached = [robot for robot in self.robots if robot.constraint_id is not None]
+        if not attached:
+            return
+        if self.phase not in (Phase.LIFT, Phase.TRANSPORT, Phase.PLACE):
+            return
+        if self.object_spec is None:
+            return
+
+        required_force = self.object_spec.mass * 9.81 * self.cfg.vacuum_force_margin
+        available_force = sum(self._constraint_force_capacity(robot) for robot in attached)
+        if available_force + 1e-6 >= required_force:
+            return
+        for robot in list(attached):
+            self._maybe_detach(robot, reason="overload")
 
     def _update_lift_target(self) -> None:
         if self.phase == Phase.LIFT:

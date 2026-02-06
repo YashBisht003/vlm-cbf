@@ -67,6 +67,20 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--size-ratio-min", type=float, default=1.0, help="Min object size ratio to robot")
     parser.add_argument("--size-ratio-max", type=float, default=3.0, help="Max object size ratio to robot")
     parser.add_argument(
+        "--constraint-force-scale",
+        type=float,
+        default=1.5,
+        help="Vacuum constraint force scale against payload",
+    )
+    parser.add_argument("--vacuum-attach-dist", type=float, default=0.1, help="Vacuum attach distance (m)")
+    parser.add_argument("--vacuum-break-dist", type=float, default=0.2, help="Vacuum break distance (m)")
+    parser.add_argument(
+        "--vacuum-force-margin",
+        type=float,
+        default=1.05,
+        help="Required force margin multiplier vs object weight",
+    )
+    parser.add_argument(
         "--auto-vlm",
         action="store_true",
         help="Capture an image and run CPU VLM inference before planning",
@@ -178,6 +192,10 @@ def main() -> None:
         agile_ee_link_name=args.agile_ee_link_name,
         object_size_ratio=(args.size_ratio_min, args.size_ratio_max),
         robot_size_mode=args.robot_size_mode,
+        constraint_force_scale=args.constraint_force_scale,
+        vacuum_attach_dist=args.vacuum_attach_dist,
+        vacuum_break_dist=args.vacuum_break_dist,
+        vacuum_force_margin=args.vacuum_force_margin,
     )
     env = VlmCbfEnv(cfg)
     env.reset()

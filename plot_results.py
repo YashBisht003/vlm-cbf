@@ -33,6 +33,11 @@ def _read_csv(path: Path) -> dict:
         "cbf_modified",
         "cbf_fallback",
         "cbf_force_stop",
+        "grasp_attach_attempts",
+        "grasp_attach_success",
+        "grasp_detach_events",
+        "grasp_overload_drop",
+        "grasp_stretch_drop",
     }
     numeric_float = {"time"}
     data = {key: [] for key in rows[0].keys() if key in numeric_int or key in numeric_float or key.startswith("time_")}
@@ -186,6 +191,24 @@ def main() -> None:
                     ("CBF Fallback", f"{cbf_fallback:.0f}"),
                     ("CBF Force Stop", f"{cbf_force:.0f}"),
                     ("CBF Rate", f"{cbf_rate:.3f}"),
+                ]
+            )
+
+        if "grasp_attach_attempts" in data:
+            grasp_attempts = float(np.nansum(data.get("grasp_attach_attempts", np.zeros_like(success))))
+            grasp_success = float(np.nansum(data.get("grasp_attach_success", np.zeros_like(success))))
+            grasp_detach = float(np.nansum(data.get("grasp_detach_events", np.zeros_like(success))))
+            grasp_overload = float(np.nansum(data.get("grasp_overload_drop", np.zeros_like(success))))
+            grasp_stretch = float(np.nansum(data.get("grasp_stretch_drop", np.zeros_like(success))))
+            grasp_rate = grasp_success / max(grasp_attempts, 1.0)
+            rows.extend(
+                [
+                    ("Grasp Attempts", f"{grasp_attempts:.0f}"),
+                    ("Grasp Success", f"{grasp_success:.0f}"),
+                    ("Grasp Attach Rate", f"{grasp_rate:.3f}"),
+                    ("Grasp Detach Events", f"{grasp_detach:.0f}"),
+                    ("Grasp Overload Drops", f"{grasp_overload:.0f}"),
+                    ("Grasp Stretch Drops", f"{grasp_stretch:.0f}"),
                 ]
             )
 

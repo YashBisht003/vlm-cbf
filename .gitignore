@@ -16,12 +16,17 @@ screenshots/
 cpu_vlm_model.joblib
 mappo_policy*.pt
 checkpoints/
+checkpoints_*/
+*_policy.pt
 
 # Logs and metrics
 train_metrics.csv
 *.log
 *.err
 eval_results*.csv
+verify_smoke_*.csv
+iros_artifacts/
+suite_summary.*
 
 # OS / editor
 .DS_Store

@@ -109,7 +109,7 @@ This trains a decentralized GNN policy with a centralized critic (CTDE).
 It can run on CPU, but will be much faster on a GPU.
 
 ```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 200 --steps-per-update 512 --out mappo_policy.pt --checkpoint-dir checkpoints --save-every 25 --save-latest
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --steps-per-update 512 --out mappo_policy.pt --checkpoint-dir checkpoints --save-every 25 --save-latest --log-interval 10
 ```
 
 Resume from latest checkpoint:
@@ -122,14 +122,58 @@ Resume from best checkpoint:
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --resume-best --checkpoint-dir checkpoints --save-latest --best-metric success_rate
 ```
 
+CPU-focused run (limit Torch threads explicitly):
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --steps-per-update 384 --torch-threads 4 --checkpoint-dir checkpoints --save-latest
+```
+
+GPU-focused run:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --device cuda --updates 1600 --steps-per-update 512 --checkpoint-dir checkpoints --save-latest
+```
+
+Checkpoint behavior:
+- `mappo_policy_latest.pt` is saved every update (unless `--no-save-latest`).
+- `mappo_policy_update_XXXX.pt` is saved every `--save-every` updates.
+- `mappo_policy_best.pt` is updated when `--best-metric` improves.
+- Resume searches latest, then latest numbered checkpoint, then final output.
+- Save verification is enabled by default (`--verify-checkpoints` / `--no-verify-checkpoints`).
+
 Run the trained policy:
 ```powershell
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_policy.py --model mappo_policy.pt --headless --deterministic
 ```
 
+Evaluate trained policy over many episodes:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" eval_policy_runs.py --model checkpoints\mappo_policy_best.pt --episodes 500 --headless --out eval_learned_policy.csv
+```
+
+## IROS Suite
+Run full train/eval/report pipeline:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train
+```
+
+This script runs:
+- MAPPO training (or resume)
+- Learned policy evaluation
+- Heuristic baseline evaluation (with and without CBF)
+- Plot generation + summary tables
+- `suite_summary.csv` and `suite_summary.md`
+
 ## Safety Filter (CBF/QP)
 The environment applies a CBF/QP safety filter per robot using OSQP.
 If the solver fails, the robot executes a monitored stop (safe fallback).
+
+## Vacuum End Effector Model
+`carry_mode="constraint"` uses a vacuum-style fixed constraint per end effector.
+Attachment requires end-effector/object proximity (`vacuum_attach_dist`), and
+grasp can drop when:
+- end effector drifts beyond `vacuum_break_dist` (stretch drop)
+- combined grasp force capacity is below required object weight (overload drop)
+
+These events are logged in `info["grasp"]` for evaluation/debugging.
 
 ## VLM JSON Input (Optional)
 You can provide VLM formation output as JSON. The environment expects 4 waypoints
@@ -184,7 +228,9 @@ If you change these settings, regenerate the dataset before training.
 - `train_mappo.py`: MAPPO-style training script
 - `run_policy.py`: run a trained policy in the environment
 - `eval_runs.py`: batch evaluation and CSV logging
+- `eval_policy_runs.py`: batch evaluation for trained policy checkpoints
 - `plot_results.py`: plots CSV evaluation results
+- `run_iros_suite.py`: one-command IROS-style train/eval/report pipeline
 - `requirements.txt`: dependencies
 
 ## Notes / Limitations

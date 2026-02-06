@@ -58,7 +58,7 @@ class GnnPolicy(nn.Module):
         for idx in range(self.layers):
             msgs = []
             for i in range(n_agents):
-                m_sum = 0.0
+                m_sum = torch.zeros(self.msg_dim, dtype=z.dtype, device=z.device)
                 for j in range(n_agents):
                     if i == j:
                         continue
@@ -130,6 +130,15 @@ class CentralCritic(nn.Module):
         self.net = _mlp(obs_dim * n_agents, hidden, 1)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        flat = obs.reshape(-1)
+        # Accept either a single state (N, D) or a batch (B, N, D).
+        if obs.dim() == 2:
+            if obs.shape[0] != self.n_agents:
+                raise ValueError(f"Expected {self.n_agents} agents, got {obs.shape[0]}")
+            flat = obs.reshape(1, -1)
+        elif obs.dim() == 3:
+            if obs.shape[1] != self.n_agents:
+                raise ValueError(f"Expected {self.n_agents} agents, got {obs.shape[1]}")
+            flat = obs.reshape(obs.shape[0], -1)
+        else:
+            raise ValueError(f"Unexpected critic input shape: {tuple(obs.shape)}")
         return self.net(flat).squeeze(-1)
-

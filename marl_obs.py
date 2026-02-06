@@ -118,3 +118,48 @@ def build_observation(env: VlmCbfEnv) -> Tuple[np.ndarray, np.ndarray]:
 
 def obs_dim() -> int:
     return 2 + 1 + 2 + 2 + 2 + 2 + len(PHASES) + 2 + 3 + 3 + 3 + 6
+
+
+def build_global_state(env: VlmCbfEnv) -> np.ndarray:
+    obj_pos, obj_quat = env._get_object_pose(noisy=env.cfg.use_noisy_obs)
+    obj_pos = np.array(obj_pos, dtype=np.float32)
+    obj_yaw = float(_yaw_from_quat(obj_quat))
+    goal = np.array(env.goal_pos, dtype=np.float32)
+    phase_vec = _phase_one_hot(env.phase.value)
+    if env.object_belief is not None:
+        belief_mu = env.object_belief.mean().astype(np.float32)
+        belief_cov = env.object_belief.covariance().astype(np.float32)
+    else:
+        belief_mu = np.array([obj_pos[0], obj_pos[1], obj_yaw, 0.0, 0.0, 0.0], dtype=np.float32)
+        belief_cov = np.eye(6, dtype=np.float32) * 1e-3
+
+    forces = []
+    for robot in env.robots:
+        force = float(env._contact_force(robot)) if hasattr(env, "_contact_force") else 0.0
+        forces.append(force / max(env.cfg.contact_force_max, 1e-3))
+    force_arr = np.asarray(forces, dtype=np.float32)
+    if force_arr.size == 0:
+        force_stats = np.zeros(3, dtype=np.float32)
+    else:
+        force_stats = np.array(
+            [float(np.mean(force_arr)), float(np.std(force_arr)), float(np.max(force_arr))],
+            dtype=np.float32,
+        )
+
+    global_state = np.concatenate(
+        [
+            obj_pos,
+            np.array([obj_yaw], dtype=np.float32),
+            goal,
+            phase_vec,
+            belief_mu,
+            np.diag(belief_cov).astype(np.float32)[:6],
+            force_stats,
+        ],
+        axis=0,
+    )
+    return global_state
+
+
+def global_state_dim() -> int:
+    return 3 + 1 + 3 + len(PHASES) + 6 + 6 + 3

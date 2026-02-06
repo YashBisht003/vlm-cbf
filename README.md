@@ -137,6 +137,9 @@ Zero-shot vs fine-tuned comparison:
 ## Train GNN Policy (MAPPO)
 This trains a decentralized GNN policy with a centralized critic (CTDE).
 It can run on CPU, but will be much faster on a GPU.
+The critic input includes:
+- concatenated per-agent observations
+- explicit global state (`object pose`, `goal`, `phase`, `belief mean/cov`, force stats)
 
 ```powershell
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --steps-per-update 512 --out mappo_policy.pt --checkpoint-dir checkpoints --save-every 25 --save-latest --log-interval 10
@@ -199,7 +202,7 @@ Include VLM formation evaluation in suite:
 
 ## Safety Filter (CBF/QP)
 The environment applies a CBF/QP safety filter per robot using OSQP.
-If the solver fails, the robot executes a monitored stop (safe fallback).
+If the solver fails, the robot executes a monitored stop profile (`v <- v - k*dt*v`).
 The QP includes a slack variable for feasibility and clips final velocity to
 the ISO speed norm bound.
 

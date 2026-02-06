@@ -39,6 +39,16 @@ class NeuralForceCBF(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden, 1),
         )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.net:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.5)
+                nn.init.zeros_(module.bias)
+        last = self.net[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.constant_(last.bias, 0.2)
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         return self.net(features).squeeze(-1)
@@ -68,25 +78,14 @@ class NeuralCbfRuntime:
         if model_path:
             self.load(model_path)
 
-    def _heuristic_barrier(self, force_n: float, belief_cov: np.ndarray) -> float:
-        cov = np.asarray(belief_cov, dtype=np.float32)
-        pos_u = float(np.sqrt(max(0.0, cov[0, 0] + cov[1, 1])))
-        yaw_u = float(np.sqrt(max(0.0, cov[2, 2]))) if cov.shape[0] >= 3 else 0.0
-        return 1.0 - float(force_n) - 0.25 * pos_u - 0.15 * yaw_u
-
     def eval_barrier(self, force_n: float, belief_mu: np.ndarray, belief_cov: np.ndarray) -> NeuralCbfEval:
         features = build_neural_cbf_input(force_n=force_n, belief_mu=belief_mu, belief_cov=belief_cov)
         if features.shape[0] != self.input_dim:
             raise ValueError(f"Neural CBF input dim mismatch: got {features.shape[0]}, expected {self.input_dim}")
         with torch.no_grad():
             x = torch.tensor(features, dtype=torch.float32, device=self.device).unsqueeze(0)
-            net_h = float(self.model(x).item())
-        heuristic_h = self._heuristic_barrier(force_n=force_n, belief_cov=belief_cov)
-        if self.has_trained_weights:
-            h_value = net_h
-        else:
-            h_value = 0.25 * net_h + 0.75 * heuristic_h
-        return NeuralCbfEval(h_value=float(h_value), features=features)
+            h_value = float(self.model(x).item())
+        return NeuralCbfEval(h_value=h_value, features=features)
 
     def load(self, model_path: str) -> None:
         path = Path(model_path)
@@ -114,3 +113,16 @@ def neural_cbf_loss(h_values: torch.Tensor, safe_labels: torch.Tensor, margin: f
     targets = (safe_labels * 2.0 - 1.0) * float(margin)
     return F.relu(targets - h_values).pow(2).mean()
 
+
+def neural_cbf_temporal_loss(
+    h_prev: torch.Tensor,
+    h_next: torch.Tensor,
+    alpha_dt: float,
+    margin: float = 0.0,
+) -> torch.Tensor:
+    """
+    Barrier residual objective:
+      h_{t+1} - h_t + alpha*dt*h_t >= margin
+    """
+    residual = h_next - h_prev + float(alpha_dt) * h_prev
+    return F.relu(float(margin) - residual).pow(2).mean()

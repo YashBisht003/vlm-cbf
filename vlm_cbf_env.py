@@ -97,6 +97,7 @@ class TaskConfig:
     cbf_risk_s_force: float = 1.0
     cbf_risk_s_neural: float = 1.0
     cbf_eps: float = 0.2
+    monitored_stop_gain: float = 8.0
     use_ekf: bool = True
     ekf_q_pos: float = 1e-3
     ekf_q_vel: float = 1e-2
@@ -111,7 +112,6 @@ class TaskConfig:
     neural_cbf_device: str = "cpu"
     neural_cbf_tighten_gain: float = 0.35
     neural_cbf_sigmoid_gain: float = 3.0
-    neural_cbf_use_qp_constraint: bool = True
     neural_cbf_alpha: float = 1.0
     neural_cbf_fd_eps: float = 1e-3
     neural_cbf_force_vel_gain: float = 4.0
@@ -1061,6 +1061,14 @@ class VlmCbfEnv:
     def _risk_factor(self, severity: float, metric: float) -> float:
         return float(1.0 + self.cfg.cbf_kappa * max(0.0, severity) * max(0.0, metric))
 
+    def _monitored_stop_velocity(self, robot: RobotInstance) -> np.ndarray:
+        current_v = self.last_safe_vel.get(robot.base_id, np.zeros(2, dtype=np.float32)).astype(np.float32)
+        decay = max(0.0, 1.0 - self.cfg.monitored_stop_gain * self.control_dt)
+        v_stop = current_v * decay
+        if float(np.linalg.norm(v_stop)) < 1e-3:
+            return np.zeros(2, dtype=np.float32)
+        return v_stop
+
     def _cbf_filter(self, robot: RobotInstance, v_des: np.ndarray) -> np.ndarray:
         self.cbf_stats["calls"] += 1
         pos_i, _ = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=self.client_id)
@@ -1140,19 +1148,18 @@ class VlmCbfEnv:
             neural_h_ref = _neural_h_for_velocity(v_ref)
             neural_h = neural_h_ref
 
-            if self.cfg.neural_cbf_use_qp_constraint:
-                fd_eps = max(float(self.cfg.neural_cbf_fd_eps), 1e-5)
-                grad = np.zeros(2, dtype=np.float32)
-                for axis in range(2):
-                    delta = np.zeros(2, dtype=np.float32)
-                    delta[axis] = fd_eps
-                    h_plus = _neural_h_for_velocity(v_ref + delta)
-                    h_minus = _neural_h_for_velocity(v_ref - delta)
-                    grad[axis] = (h_plus - h_minus) / (2.0 * fd_eps)
-                grad_norm = float(np.linalg.norm(grad))
-                if grad_norm > 1e-7:
-                    rhs = float(np.dot(grad, v_ref) - (1.0 + self.cfg.neural_cbf_alpha) * neural_h_ref)
-                    extra_linear.append((grad.copy(), rhs))
+            fd_eps = max(float(self.cfg.neural_cbf_fd_eps), 1e-5)
+            grad = np.zeros(2, dtype=np.float32)
+            for axis in range(2):
+                delta = np.zeros(2, dtype=np.float32)
+                delta[axis] = fd_eps
+                h_plus = _neural_h_for_velocity(v_ref + delta)
+                h_minus = _neural_h_for_velocity(v_ref - delta)
+                grad[axis] = (h_plus - h_minus) / (2.0 * fd_eps)
+            grad_norm = float(np.linalg.norm(grad))
+            if grad_norm > 1e-7:
+                rhs = float(np.dot(grad, v_ref) - (1.0 + self.cfg.neural_cbf_alpha) * neural_h_ref)
+                extra_linear.append((grad.copy(), rhs))
 
             tighten = max(0.0, -neural_h_ref) * self.cfg.neural_cbf_tighten_gain
             d_min *= 1.0 + tighten
@@ -1206,12 +1213,12 @@ class VlmCbfEnv:
 
         if not result.success:
             # fallback: monitored stop
-            v_safe = np.zeros_like(v_safe)
+            v_safe = self._monitored_stop_velocity(robot)
             self.cbf_stats["fallback"] += 1
 
         if contact_force > contact_force_max_eff:
             self.violations["force"] += 1
-            v_safe = np.zeros_like(v_safe)
+            v_safe = self._monitored_stop_velocity(robot)
             self.cbf_stats["force_stop"] += 1
 
         intervention_l2 = float(np.linalg.norm(v_safe - v_des) ** 2)

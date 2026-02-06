@@ -124,12 +124,13 @@ class GnnPolicy(nn.Module):
 
 
 class CentralCritic(nn.Module):
-    def __init__(self, obs_dim: int, n_agents: int = 4, hidden: int = 256) -> None:
+    def __init__(self, obs_dim: int, n_agents: int = 4, hidden: int = 256, global_dim: int = 0) -> None:
         super().__init__()
         self.n_agents = n_agents
-        self.net = _mlp(obs_dim * n_agents, hidden, 1)
+        self.global_dim = int(global_dim)
+        self.net = _mlp(obs_dim * n_agents + self.global_dim, hidden, 1)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs: torch.Tensor, global_state: torch.Tensor | None = None) -> torch.Tensor:
         # Accept either a single state (N, D) or a batch (B, N, D).
         if obs.dim() == 2:
             if obs.shape[0] != self.n_agents:
@@ -141,4 +142,20 @@ class CentralCritic(nn.Module):
             flat = obs.reshape(obs.shape[0], -1)
         else:
             raise ValueError(f"Unexpected critic input shape: {tuple(obs.shape)}")
+        if self.global_dim > 0:
+            if global_state is None:
+                raise ValueError("global_state is required when global_dim > 0")
+            if global_state.dim() == 1:
+                g = global_state.reshape(1, -1)
+            elif global_state.dim() == 2:
+                g = global_state
+            else:
+                raise ValueError(f"Unexpected global_state shape: {tuple(global_state.shape)}")
+            if g.shape[1] != self.global_dim:
+                raise ValueError(f"Expected global_state dim {self.global_dim}, got {g.shape[1]}")
+            if g.shape[0] not in (1, flat.shape[0]):
+                raise ValueError(f"Batch mismatch: critic batch {flat.shape[0]} vs global {g.shape[0]}")
+            if g.shape[0] == 1 and flat.shape[0] > 1:
+                g = g.expand(flat.shape[0], -1)
+            flat = torch.cat([flat, g], dim=1)
         return self.net(flat).squeeze(-1)

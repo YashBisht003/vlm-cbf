@@ -77,14 +77,59 @@ def _parse_args() -> argparse.Namespace:
         default=1.5,
         help="Vacuum constraint force scale against payload",
     )
-    parser.add_argument("--vacuum-attach-dist", type=float, default=0.1, help="Vacuum attach distance (m)")
-    parser.add_argument("--vacuum-break-dist", type=float, default=0.2, help="Vacuum break distance (m)")
+    parser.add_argument("--vacuum-attach-dist", type=float, default=0.18, help="Vacuum attach distance (m)")
+    parser.add_argument("--vacuum-break-dist", type=float, default=0.30, help="Vacuum break distance (m)")
     parser.add_argument(
         "--vacuum-force-margin",
         type=float,
         default=1.05,
         help="Required force margin multiplier vs object weight",
     )
+    parser.add_argument(
+        "--base-drive-mode",
+        choices=("velocity", "wheel"),
+        default="velocity",
+        help="Base drive model (velocity is robust; wheel is full wheel dynamics)",
+    )
+    parser.add_argument("--phase-approach-dist", type=float, default=0.25, help="Approach ready distance (m)")
+    parser.add_argument(
+        "--phase-approach-timeout-s",
+        type=float,
+        default=20.0,
+        help="Approach timeout before quorum fallback (s)",
+    )
+    parser.add_argument(
+        "--phase-approach-min-ready",
+        type=int,
+        default=2,
+        help="Ready quorum for approach timeout fallback",
+    )
+    parser.add_argument(
+        "--udp-phase",
+        dest="udp_phase",
+        action="store_true",
+        help="Enable UDP distributed phase coordination (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-udp-phase",
+        dest="udp_phase",
+        action="store_false",
+        help="Disable UDP distributed phase coordination",
+    )
+    parser.add_argument(
+        "--udp-neighbor-state",
+        dest="udp_neighbor_state",
+        action="store_true",
+        help="Use UDP neighbor state in CBF (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-udp-neighbor-state",
+        dest="udp_neighbor_state",
+        action="store_false",
+        help="Disable UDP neighbor state in CBF",
+    )
+    parser.add_argument("--udp-base-port", type=int, default=39000, help="Base UDP port for robot peers")
+    parser.set_defaults(udp_phase=True, udp_neighbor_state=True)
     return parser.parse_args()
 
 
@@ -107,6 +152,7 @@ def _run_episode(env: VlmCbfEnv, max_steps: int) -> dict:
     phase_times[prev_phase] += info["time"] - prev_time
     cbf_stats = info.get("cbf", {})
     grasp_stats = info.get("grasp", {})
+    phase_sync = info.get("phase_sync", {})
     return {
         "success": int(info["phase"] == "done"),
         "steps": steps,
@@ -127,6 +173,11 @@ def _run_episode(env: VlmCbfEnv, max_steps: int) -> dict:
             "detach_events": grasp_stats.get("detach_events", 0),
             "overload_drop": grasp_stats.get("overload_drop", 0),
             "stretch_drop": grasp_stats.get("stretch_drop", 0),
+        },
+        "phase_sync": {
+            "last_delay_ms": phase_sync.get("last_delay_ms", 0.0),
+            "mean_delay_ms": phase_sync.get("mean_delay_ms", 0.0),
+            "events": phase_sync.get("events", 0),
         },
     }
 
@@ -156,6 +207,13 @@ def main() -> None:
         vacuum_attach_dist=args.vacuum_attach_dist,
         vacuum_break_dist=args.vacuum_break_dist,
         vacuum_force_margin=args.vacuum_force_margin,
+        base_drive_mode=args.base_drive_mode,
+        phase_approach_dist=args.phase_approach_dist,
+        phase_approach_timeout_s=args.phase_approach_timeout_s,
+        phase_approach_min_ready=args.phase_approach_min_ready,
+        use_udp_phase=args.udp_phase,
+        use_udp_neighbor_state=args.udp_neighbor_state,
+        udp_base_port=args.udp_base_port,
         use_cbf=not args.no_cbf,
     )
     env = VlmCbfEnv(cfg)
@@ -201,12 +259,16 @@ def main() -> None:
             "grasp_detach_events",
             "grasp_overload_drop",
             "grasp_stretch_drop",
+            "phase_sync_last_ms",
+            "phase_sync_mean_ms",
+            "phase_sync_events",
         ] + [f"time_{k}" for k in phase_keys]
         writer.writerow(header)
         for idx, res in enumerate(results):
             viol = res["violations"]
             cbf = res.get("cbf", {})
             grasp = res.get("grasp", {})
+            psync = res.get("phase_sync", {})
             row = [
                 idx,
                 res["success"],
@@ -226,6 +288,9 @@ def main() -> None:
                 grasp.get("detach_events", 0),
                 grasp.get("overload_drop", 0),
                 grasp.get("stretch_drop", 0),
+                psync.get("last_delay_ms", 0.0),
+                psync.get("mean_delay_ms", 0.0),
+                psync.get("events", 0),
             ]
             row.extend([f"{res['phase_times'].get(k, 0.0):.3f}" for k in phase_keys])
             writer.writerow(row)

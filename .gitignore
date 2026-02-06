@@ -18,6 +18,7 @@ mappo_policy*.pt
 checkpoints/
 checkpoints_*/
 *_policy.pt
+llava_lora_out/
 
 # Logs and metrics
 train_metrics.csv
@@ -27,6 +28,8 @@ eval_results*.csv
 verify_smoke_*.csv
 iros_artifacts/
 suite_summary.*
+vlm_eval_*.csv
+vlm_eval_*.json
 
 # OS / editor
 .DS_Store

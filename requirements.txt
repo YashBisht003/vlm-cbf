@@ -7,3 +7,9 @@ scikit-learn>=1.4
 scikit-image>=0.23
 torch
 osqp
+transformers>=4.44
+peft>=0.11
+accelerate>=0.30
+datasets>=2.20
+Pillow>=10.0
+bitsandbytes>=0.43; platform_system != "Windows"

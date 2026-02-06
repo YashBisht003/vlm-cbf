@@ -16,6 +16,8 @@ controllers and a kinematic carry model for stability.
 - Python 3.11+
 - Windows: PyBullet may require Microsoft C++ Build Tools to build from source
 - OSQP is used for the CBF/QP safety filter
+- LLaVA fine-tuning uses `transformers`, `peft`, and `accelerate`
+- 4-bit QLoRA path uses `bitsandbytes` (Linux recommended)
 
 ## Setup
 Use the external venv you created:
@@ -45,8 +47,9 @@ By default, the simulator uses a differential-drive base for agile robots and an
 for heavy robots. The base URDFs live in `assets/` and can be swapped via:
 - `base_diff_urdf` and `base_omni_urdf` in `TaskConfig`
 
-The base controller uses wheel velocity control (no kinematic teleport) when
-`kinematic_base=False` (default).
+Default runtime drive mode is `base_drive_mode="velocity"` (robust for training).
+You can switch to `base_drive_mode="wheel"` for direct wheel-drive dynamics.
+`kinematic_base=False` remains default in both modes.
 
 ## Evaluate
 Run multiple episodes and write a CSV summary:
@@ -102,6 +105,33 @@ This trains a lightweight HOG+Ridge model that outputs the same JSON format as t
 Run inference on a single image:
 ```powershell
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" infer_vlm_cpu.py --model cpu_vlm_model.joblib --image vlm_dataset\images\sample_000000_view_00.png --out formation.json
+```
+
+## Train LLaVA-1.5-7B with LoRA (Reproducible Path)
+This is the actual LLaVA+LoRA pipeline (separate from CPU proxy).
+Default paper-style knobs in script:
+- LoRA rank: `16`
+- LoRA alpha: `32`
+- Epochs: `3`
+
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_vlm_llava_lora.py --model-id llava-hf/llava-1.5-7b-hf --train-jsonl vlm_dataset\train.jsonl --val-jsonl vlm_dataset\val.jsonl --image-root vlm_dataset --out llava_lora_out --epochs 3 --lora-rank 16 --lora-alpha 32 --use-4bit --fp16
+```
+
+Inference with LoRA adapter:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" infer_vlm_llava.py --model-id llava-hf/llava-1.5-7b-hf --adapter llava_lora_out\adapter --image vlm_dataset\images\sample_000000_view_00.png --out llava_formation.json
+```
+
+Formation metric evaluation:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" eval_vlm_formations.py --jsonl vlm_dataset\val.jsonl --image-root vlm_dataset --model-id llava-hf/llava-1.5-7b-hf --adapter llava_lora_out\adapter --out-csv vlm_eval_samples.csv --out-json vlm_eval_metrics.json
+```
+
+Zero-shot vs fine-tuned comparison:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" eval_vlm_formations.py --jsonl vlm_dataset\val.jsonl --image-root vlm_dataset --model-id llava-hf/llava-1.5-7b-hf --out-json vlm_eval_zeroshot.json
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" eval_vlm_formations.py --jsonl vlm_dataset\val.jsonl --image-root vlm_dataset --model-id llava-hf/llava-1.5-7b-hf --adapter llava_lora_out\adapter --out-json vlm_eval_finetuned.json
 ```
 
 ## Train GNN Policy (MAPPO)
@@ -162,9 +192,25 @@ This script runs:
 - Plot generation + summary tables
 - `suite_summary.csv` and `suite_summary.md`
 
+Include VLM formation evaluation in suite:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train --run-vlm-eval --vlm-model-id llava-hf/llava-1.5-7b-hf --vlm-adapter llava_lora_out\adapter
+```
+
 ## Safety Filter (CBF/QP)
 The environment applies a CBF/QP safety filter per robot using OSQP.
 If the solver fails, the robot executes a monitored stop (safe fallback).
+The QP includes a slack variable for feasibility and clips final velocity to
+the ISO speed norm bound.
+
+## Distributed Phase + UDP
+Phase synchronization supports a UDP peer-broadcast mode:
+- `use_udp_phase=True`
+- `use_udp_neighbor_state=True`
+- `udp_base_port=<port>`
+
+This keeps phase voting and neighbor-state exchange out of a centralized loop
+and logs phase sync delay metrics in `info["phase_sync"]`.
 
 ## Vacuum End Effector Model
 `carry_mode="constraint"` uses a vacuum-style fixed constraint per end effector.
@@ -197,6 +243,11 @@ Use it with:
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_demo.py --vlm-json path\to\formation.json
 ```
 
+Auto infer formation inside demo:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_demo.py --auto-vlm --vlm-backend llava --vlm-model llava-hf/llava-1.5-7b-hf --vlm-adapter llava_lora_out\adapter
+```
+
 ## Quantec URDF Notes
 If you use a KUKA Quantec URDF/xacro, prefer passing a tool-frame link name
 like `tool0` or `flange`:
@@ -226,17 +277,24 @@ If you change these settings, regenerate the dataset before training.
 - `marl_obs.py`: observation builder for multi-agent policy training
 - `gnn_policy.py`: GNN policy and centralized critic definitions
 - `train_mappo.py`: MAPPO-style training script
+- `train_vlm_llava_lora.py`: LLaVA LoRA fine-tuning script
 - `run_policy.py`: run a trained policy in the environment
 - `eval_runs.py`: batch evaluation and CSV logging
 - `eval_policy_runs.py`: batch evaluation for trained policy checkpoints
+- `eval_vlm_formations.py`: formation/fallback accuracy evaluation for VLM outputs
+- `infer_vlm_llava.py`: LLaVA inference to JSON formation output
 - `plot_results.py`: plots CSV evaluation results
 - `run_iros_suite.py`: one-command IROS-style train/eval/report pipeline
 - `requirements.txt`: dependencies
 
 ## Notes / Limitations
-- The VLM formation is a stub (confidence-based fallback is implemented).
+- CPU VLM (`train_vlm_cpu.py`) is a lightweight proxy, not a replacement for LLaVA fine-tuning.
+- If no VLM output is provided, the environment still falls back to geometric formation.
+- Reproduce VLM claims from this repo using `train_vlm_llava_lora.py` + `eval_vlm_formations.py` on a fixed split.
 - Default `carry_mode="auto"` tries suction constraints first and falls back to
   kinematic carry if attachment does not stabilize within a short window.
 - `carry_mode="constraint"` is the most physically faithful, but may need tuning
   for very heavy payloads or noisy contacts.
+- The environment now includes approach timeout quorum fallback for phase progression
+  in difficult randomized layouts (`phase_approach_timeout_s`, `phase_approach_min_ready`).
 - This is an environment scaffold; it is ready to integrate with your policy.

@@ -72,8 +72,8 @@ def _parse_args() -> argparse.Namespace:
         default=1.5,
         help="Vacuum constraint force scale against payload",
     )
-    parser.add_argument("--vacuum-attach-dist", type=float, default=0.1, help="Vacuum attach distance (m)")
-    parser.add_argument("--vacuum-break-dist", type=float, default=0.2, help="Vacuum break distance (m)")
+    parser.add_argument("--vacuum-attach-dist", type=float, default=0.18, help="Vacuum attach distance (m)")
+    parser.add_argument("--vacuum-break-dist", type=float, default=0.30, help="Vacuum break distance (m)")
     parser.add_argument(
         "--vacuum-force-margin",
         type=float,
@@ -81,14 +81,69 @@ def _parse_args() -> argparse.Namespace:
         help="Required force margin multiplier vs object weight",
     )
     parser.add_argument(
+        "--base-drive-mode",
+        choices=("velocity", "wheel"),
+        default="velocity",
+        help="Base drive model (velocity is robust; wheel is full wheel dynamics)",
+    )
+    parser.add_argument("--phase-approach-dist", type=float, default=0.25, help="Approach ready distance (m)")
+    parser.add_argument(
+        "--phase-approach-timeout-s",
+        type=float,
+        default=20.0,
+        help="Approach timeout before quorum fallback (s)",
+    )
+    parser.add_argument(
+        "--phase-approach-min-ready",
+        type=int,
+        default=2,
+        help="Ready quorum for approach timeout fallback",
+    )
+    parser.add_argument(
+        "--udp-phase",
+        dest="udp_phase",
+        action="store_true",
+        help="Enable UDP distributed phase coordination (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-udp-phase",
+        dest="udp_phase",
+        action="store_false",
+        help="Disable UDP distributed phase coordination",
+    )
+    parser.add_argument(
+        "--udp-neighbor-state",
+        dest="udp_neighbor_state",
+        action="store_true",
+        help="Use UDP neighbor state in CBF (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-udp-neighbor-state",
+        dest="udp_neighbor_state",
+        action="store_false",
+        help="Disable UDP neighbor state in CBF",
+    )
+    parser.add_argument("--udp-base-port", type=int, default=39000, help="Base UDP port for robot peers")
+    parser.add_argument(
         "--auto-vlm",
         action="store_true",
-        help="Capture an image and run CPU VLM inference before planning",
+        help="Capture an image and run selected VLM backend before planning",
+    )
+    parser.add_argument(
+        "--vlm-backend",
+        choices=("cpu", "llava"),
+        default="cpu",
+        help="Backend for --auto-vlm inference",
     )
     parser.add_argument(
         "--vlm-model",
         default="cpu_vlm_model.joblib",
-        help="CPU VLM model file for auto inference",
+        help="Model file for selected backend (CPU model path or LLaVA model id/path)",
+    )
+    parser.add_argument(
+        "--vlm-adapter",
+        default="",
+        help="Optional LLaVA LoRA adapter path (used when --vlm-backend llava)",
     )
     parser.add_argument(
         "--vlm-out",
@@ -101,6 +156,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--screenshots-dir", default="screenshots", help="Output directory for screenshots")
     parser.add_argument("--screenshot-width", type=int, default=1280, help="Screenshot width")
     parser.add_argument("--screenshot-height", type=int, default=720, help="Screenshot height")
+    parser.set_defaults(udp_phase=True, udp_neighbor_state=True)
     return parser.parse_args()
 
 
@@ -171,6 +227,24 @@ def _run_cpu_vlm(model_path: Path, image_path: Path) -> dict:
     return infer_image(model_path, image_path)
 
 
+def _run_llava_vlm(model_ref: str, adapter_path: str, image_path: Path) -> dict:
+    try:
+        from infer_vlm_llava import infer_image
+    except Exception as exc:  # pragma: no cover
+        raise ImportError("infer_vlm_llava.py is required for LLaVA auto inference.") from exc
+    model_path = ""
+    model_id = model_ref
+    if Path(model_ref).exists():
+        model_path = model_ref
+        model_id = "llava-hf/llava-1.5-7b-hf"
+    return infer_image(
+        image_path=image_path,
+        model_id=model_id,
+        model_path=model_path,
+        adapter=adapter_path,
+    )
+
+
 def main() -> None:
     args = _parse_args()
     cfg = TaskConfig(
@@ -196,6 +270,13 @@ def main() -> None:
         vacuum_attach_dist=args.vacuum_attach_dist,
         vacuum_break_dist=args.vacuum_break_dist,
         vacuum_force_margin=args.vacuum_force_margin,
+        base_drive_mode=args.base_drive_mode,
+        phase_approach_dist=args.phase_approach_dist,
+        phase_approach_timeout_s=args.phase_approach_timeout_s,
+        phase_approach_min_ready=args.phase_approach_min_ready,
+        use_udp_phase=args.udp_phase,
+        use_udp_neighbor_state=args.udp_neighbor_state,
+        udp_base_port=args.udp_base_port,
     )
     env = VlmCbfEnv(cfg)
     env.reset()
@@ -210,7 +291,10 @@ def main() -> None:
         image_path = Path("vlm_auto.png")
         renderer = p.ER_TINY_RENDERER if args.headless else p.ER_BULLET_HARDWARE_OPENGL
         _capture_vlm_image(env, image_path, renderer=renderer)
-        output = _run_cpu_vlm(Path(args.vlm_model), image_path)
+        if args.vlm_backend == "cpu":
+            output = _run_cpu_vlm(Path(args.vlm_model), image_path)
+        else:
+            output = _run_llava_vlm(args.vlm_model, args.vlm_adapter, image_path)
         Path(args.vlm_out).write_text(json.dumps(output, indent=2), encoding="utf-8")
     steps = 0
     last_phase = None

@@ -17,6 +17,7 @@ except Exception:  # pragma: no cover
 class CbfResult:
     v_safe: np.ndarray
     success: bool
+    slack: float = 0.0
 
 
 def solve_cbf_qp(
@@ -27,30 +28,43 @@ def solve_cbf_qp(
     v_max: float,
     d_min: float,
     alpha: float,
+    slack_weight: float = 100.0,
+    slack_max: float = 3.0,
 ) -> CbfResult:
     """
-    Solve min ||v - v_des||^2 subject to:
+    Solve min ||v - v_des||^2 + w*s^2 subject to:
       |vx| <= v_max, |vy| <= v_max
-      2 (p_i - p_j)^T v_i >= -alpha * B_ij + 2 (p_i - p_j)^T v_j
+      s >= 0
+      2 (p_i - p_j)^T v_i + s >= -alpha * B_ij + 2 (p_i - p_j)^T v_j
     """
     v_des = np.asarray(v_des, dtype=np.float64).reshape(2)
     pos_i = np.asarray(pos_i, dtype=np.float64).reshape(2)
+    slack_weight = max(float(slack_weight), 1e-6)
+    slack_max = max(float(slack_max), 1e-6)
+
+    def _clip_speed(v: np.ndarray, vmax: float) -> np.ndarray:
+        vn = float(np.linalg.norm(v))
+        if vn <= float(vmax) + 1e-9:
+            return v
+        return v * (float(vmax) / max(vn, 1e-9))
 
     # Fallback if solver missing.
     if osqp is None or sparse is None:
-        v_clip = np.clip(v_des, -v_max, v_max)
-        return CbfResult(v_safe=v_clip, success=False)
+        v_clip = _clip_speed(np.clip(v_des, -v_max, v_max), v_max)
+        return CbfResult(v_safe=v_clip, success=False, slack=0.0)
 
-    P = sparse.csc_matrix(np.eye(2))
-    q = -v_des
+    # Decision variable x = [vx, vy, s]
+    P = sparse.csc_matrix(np.diag([1.0, 1.0, slack_weight]))
+    q = np.array([-v_des[0], -v_des[1], 0.0], dtype=np.float64)
 
     A_rows = []
     l = []
     u = []
 
     # Box constraints.
-    A_rows.append([1.0, 0.0]); l.append(-v_max); u.append(v_max)
-    A_rows.append([0.0, 1.0]); l.append(-v_max); u.append(v_max)
+    A_rows.append([1.0, 0.0, 0.0]); l.append(-v_max); u.append(v_max)
+    A_rows.append([0.0, 1.0, 0.0]); l.append(-v_max); u.append(v_max)
+    A_rows.append([0.0, 0.0, 1.0]); l.append(0.0); u.append(slack_max)
 
     # Separation constraints.
     for pj, vj in zip(neighbor_pos, neighbor_vel):
@@ -59,7 +73,7 @@ def solve_cbf_qp(
         delta = pos_i - pj
         B = float(np.dot(delta, delta) - d_min * d_min)
         rhs = -alpha * B + 2.0 * float(np.dot(delta, vj))
-        A_rows.append([2.0 * delta[0], 2.0 * delta[1]])
+        A_rows.append([2.0 * delta[0], 2.0 * delta[1], 1.0])
         l.append(rhs)
         u.append(np.inf)
 
@@ -68,9 +82,11 @@ def solve_cbf_qp(
     u = np.array(u, dtype=np.float64)
 
     solver = osqp.OSQP()
-    solver.setup(P=P, q=q, A=A, l=l, u=u, verbose=False, polish=True, warm_start=True)
+    solver.setup(P=P, q=q, A=A, l=l, u=u, verbose=False, polish=False, warm_start=True)
     result = solver.solve()
     status = str(result.info.status).lower()
-    if "solved" in status:
-        return CbfResult(v_safe=result.x, success=True)
-    return CbfResult(v_safe=np.clip(v_des, -v_max, v_max), success=False)
+    if "solved" in status and result.x is not None and len(result.x) >= 3:
+        v = np.array([result.x[0], result.x[1]], dtype=np.float64)
+        v = _clip_speed(v, v_max)
+        return CbfResult(v_safe=v, success=True, slack=float(max(0.0, result.x[2])))
+    return CbfResult(v_safe=_clip_speed(np.clip(v_des, -v_max, v_max), v_max), success=False, slack=0.0)

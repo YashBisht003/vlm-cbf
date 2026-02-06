@@ -55,14 +55,58 @@ def _parse_args() -> argparse.Namespace:
         default=1.5,
         help="Vacuum constraint force scale against robot payload (x payload*9.81)",
     )
-    parser.add_argument("--vacuum-attach-dist", type=float, default=0.1, help="Vacuum attach distance (m)")
-    parser.add_argument("--vacuum-break-dist", type=float, default=0.2, help="Vacuum break distance (m)")
+    parser.add_argument("--vacuum-break-dist", type=float, default=0.30, help="Vacuum break distance (m)")
+    parser.add_argument("--vacuum-attach-dist", type=float, default=0.18, help="Vacuum attach distance (m)")
     parser.add_argument(
         "--vacuum-force-margin",
         type=float,
         default=1.05,
         help="Required force margin multiplier vs object weight",
     )
+    parser.add_argument(
+        "--base-drive-mode",
+        choices=("velocity", "wheel"),
+        default="velocity",
+        help="Base drive model (velocity is robust; wheel is full wheel dynamics)",
+    )
+    parser.add_argument("--phase-approach-dist", type=float, default=0.25, help="Approach ready distance (m)")
+    parser.add_argument(
+        "--phase-approach-timeout-s",
+        type=float,
+        default=20.0,
+        help="Approach timeout before quorum fallback (s)",
+    )
+    parser.add_argument(
+        "--phase-approach-min-ready",
+        type=int,
+        default=2,
+        help="Ready quorum for approach timeout fallback",
+    )
+    parser.add_argument(
+        "--udp-phase",
+        dest="udp_phase",
+        action="store_true",
+        help="Enable UDP distributed phase coordination (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-udp-phase",
+        dest="udp_phase",
+        action="store_false",
+        help="Disable UDP distributed phase coordination",
+    )
+    parser.add_argument(
+        "--udp-neighbor-state",
+        dest="udp_neighbor_state",
+        action="store_true",
+        help="Use UDP neighbor state in CBF (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-udp-neighbor-state",
+        dest="udp_neighbor_state",
+        action="store_false",
+        help="Disable UDP neighbor state in CBF",
+    )
+    parser.add_argument("--udp-base-port", type=int, default=39000, help="Base UDP port for robot peers")
     parser.add_argument("--out", default="mappo_policy.pt", help="Final checkpoint path")
     parser.add_argument("--checkpoint-dir", default="checkpoints", help="Directory for periodic checkpoints")
     parser.add_argument("--save-every", type=int, default=25, help="Checkpoint cadence (updates)")
@@ -102,7 +146,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=int, default=4000, help="Max steps per episode")
     parser.add_argument("--log-csv", default="train_metrics.csv", help="CSV log output")
-    parser.set_defaults(save_latest=True, verify_checkpoints=True)
+    parser.set_defaults(save_latest=True, verify_checkpoints=True, udp_phase=True, udp_neighbor_state=True)
     return parser.parse_args()
 
 
@@ -247,6 +291,13 @@ def main() -> None:
         vacuum_attach_dist=args.vacuum_attach_dist,
         vacuum_break_dist=args.vacuum_break_dist,
         vacuum_force_margin=args.vacuum_force_margin,
+        base_drive_mode=args.base_drive_mode,
+        phase_approach_dist=args.phase_approach_dist,
+        phase_approach_timeout_s=args.phase_approach_timeout_s,
+        phase_approach_min_ready=args.phase_approach_min_ready,
+        use_udp_phase=args.udp_phase,
+        use_udp_neighbor_state=args.udp_neighbor_state,
+        udp_base_port=args.udp_base_port,
     )
     env = VlmCbfEnv(cfg)
     env.reset()

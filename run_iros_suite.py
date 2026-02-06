@@ -62,6 +62,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--vacuum-break-dist", type=float, default=0.2, help="Vacuum break distance")
     parser.add_argument("--vacuum-force-margin", type=float, default=1.05, help="Vacuum force margin")
     parser.add_argument("--deterministic-eval", action="store_true", help="Deterministic policy eval")
+    parser.add_argument("--run-vlm-eval", action="store_true", help="Also run VLM formation evaluation")
+    parser.add_argument("--vlm-model-id", default="llava-hf/llava-1.5-7b-hf", help="VLM model id for eval")
+    parser.add_argument("--vlm-adapter", default="", help="LoRA adapter for VLM eval")
+    parser.add_argument("--vlm-model-path", default="", help="Merged VLM model path alternative")
+    parser.add_argument("--vlm-val-jsonl", default="vlm_dataset/val.jsonl", help="Validation JSONL for VLM eval")
+    parser.add_argument("--vlm-image-root", default="vlm_dataset", help="Image root for VLM eval")
     parser.add_argument("--checkpoint-dir", default="", help="Checkpoint directory (default: <out-dir>/checkpoints)")
     parser.add_argument("--policy-out", default="", help="Final policy output path (default: <out-dir>/mappo_policy.pt)")
     parser.set_defaults(verify_checkpoints=True)
@@ -185,6 +191,8 @@ def main() -> None:
     eval_policy_csv = out_dir / "eval_learned_policy.csv"
     eval_heuristic_cbf_csv = out_dir / "eval_heuristic_cbf.csv"
     eval_heuristic_no_cbf_csv = out_dir / "eval_heuristic_no_cbf.csv"
+    vlm_eval_json = out_dir / "vlm_eval_metrics.json"
+    vlm_eval_csv = out_dir / "vlm_eval_samples.csv"
 
     shared_env_args = [
         "--carry-mode",
@@ -321,6 +329,27 @@ def main() -> None:
         ]
         _run(plot_cmd, repo_dir)
 
+    if args.run_vlm_eval:
+        vlm_cmd = [
+            args.python,
+            "eval_vlm_formations.py",
+            "--jsonl",
+            args.vlm_val_jsonl,
+            "--image-root",
+            args.vlm_image_root,
+            "--model-id",
+            args.vlm_model_id,
+            "--out-csv",
+            str(vlm_eval_csv),
+            "--out-json",
+            str(vlm_eval_json),
+        ]
+        if args.vlm_adapter:
+            vlm_cmd.extend(["--adapter", args.vlm_adapter])
+        if args.vlm_model_path:
+            vlm_cmd.extend(["--model-path", args.vlm_model_path])
+        _run(vlm_cmd, repo_dir)
+
     summary_rows = [
         _summarize_csv(eval_policy_csv, "learned_policy"),
         _summarize_csv(eval_heuristic_cbf_csv, "heuristic_cbf"),
@@ -333,6 +362,9 @@ def main() -> None:
     print(f"Suite complete. Artifacts in: {out_dir}")
     print(f"Summary CSV: {summary_csv}")
     print(f"Summary MD: {summary_md}")
+    if args.run_vlm_eval:
+        print(f"VLM eval JSON: {vlm_eval_json}")
+        print(f"VLM eval CSV: {vlm_eval_csv}")
 
 
 if __name__ == "__main__":

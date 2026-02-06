@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import json
 import math
+import statistics
 from pathlib import Path
 import time
 
@@ -26,6 +27,7 @@ except Exception:  # pragma: no cover - optional fallback
 
 from belief_ekf import BeliefEKF
 from cbf_qp import solve_cbf_qp
+from p2p_udp import UdpPeerBus
 
 
 class Phase(Enum):
@@ -69,8 +71,8 @@ class TaskConfig:
     carry_mode: str = "auto"  # auto, constraint, or kinematic
     constraint_fallback_time: float = 2.0
     constraint_force_scale: float = 1.5
-    vacuum_attach_dist: float = 0.1
-    vacuum_break_dist: float = 0.2
+    vacuum_attach_dist: float = 0.18
+    vacuum_break_dist: float = 0.30
     vacuum_force_margin: float = 1.05
 
     yaw_rate_max: float = 1.2
@@ -87,10 +89,25 @@ class TaskConfig:
     cbf_alpha: float = 2.0
     cbf_kappa: float = 2.0
     cbf_risk_scale: float = 1.0
+    cbf_slack_weight: float = 100.0
+    cbf_slack_max: float = 3.0
     use_ekf: bool = True
     ekf_q_pos: float = 1e-3
     ekf_q_vel: float = 1e-2
     ekf_r_meas: float = 5e-3
+
+    use_udp_phase: bool = True
+    use_udp_neighbor_state: bool = True
+    udp_host: str = "127.0.0.1"
+    udp_base_port: int = 39000
+    udp_state_ttl_s: float = 0.25
+    phase_consensus_window_s: float = 0.10
+    phase_approach_dist: float = 0.25
+    phase_approach_timeout_s: float = 20.0
+    phase_approach_min_ready: int = 2
+    phase_contact_force_threshold: float = 5.0
+    phase_lift_stability_s: float = 1.0
+    phase_lift_vertical_speed_max: float = 0.05
 
     vlm_json_path: Optional[str] = None
     vlm_confidence_threshold: float = 0.5
@@ -108,6 +125,12 @@ class TaskConfig:
     wheel_base: float = 0.36
     track_width: float = 0.28
     base_mass: float = 50.0
+    base_ground_friction: float = 0.05
+    wheel_friction_omni: float = 1.1
+    wheel_friction_diff: float = 1.3
+    wheel_motor_force_omni: float = 1200.0
+    wheel_motor_force_diff: float = 900.0
+    base_drive_mode: str = "velocity"  # velocity or wheel
 
     object_size_ratio: Tuple[float, float] = (1.0, 3.0)
     robot_size_mode: str = "base"  # base or full
@@ -203,6 +226,8 @@ class VlmCbfEnv:
         p.setTimeStep(self.physics_dt, physicsClientId=self.client_id)
 
     def _reset_state(self) -> None:
+        if hasattr(self, "udp_bus") and self.udp_bus is not None:
+            self.udp_bus.close()
         self.robots: List[RobotInstance] = []
         self.object_id: Optional[int] = None
         self.object_spec: Optional[ObjectSpec] = None
@@ -232,6 +257,12 @@ class VlmCbfEnv:
         self.podium_height: float = self.cfg.podium_size[2]
         self.last_safe_vel: Dict[int, np.ndarray] = {}
         self.object_belief: Optional[BeliefEKF] = None
+        self.object_start_height: float = 0.0
+        self._lift_stable_since: Optional[float] = None
+        self.udp_bus: Optional[UdpPeerBus] = None
+        self.peer_packets: Dict[str, dict] = {}
+        self.phase_sync_delays_ms: List[float] = []
+        self.phase_sync_last_delay_ms: float = 0.0
 
     def reset(self) -> Dict:
         p.resetSimulation(physicsClientId=self.client_id)
@@ -250,19 +281,41 @@ class VlmCbfEnv:
             )
             obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
             self.object_belief.update((float(obj_pos[0]), float(obj_pos[1])))
+        obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
+        self.object_start_height = float(obj_pos[2])
+        if self.cfg.use_udp_phase or self.cfg.use_udp_neighbor_state:
+            self.udp_bus = UdpPeerBus(
+                robot_names=[robot.spec.name for robot in self.robots],
+                host=self.cfg.udp_host,
+                base_port=self.cfg.udp_base_port,
+            )
+            self._udp_broadcast_local_state(self._phase_local_ready_map())
+            self._udp_poll()
         self.phase = Phase.PLAN
         return self._get_obs()
 
     def close(self) -> None:
+        if self.udp_bus is not None:
+            self.udp_bus.close()
+            self.udp_bus = None
         p.disconnect(physicsClientId=self.client_id)
 
     def step(self, actions: Optional[Dict[int, RobotAction]] = None) -> Tuple[Dict, Dict]:
+        self._udp_poll()
         if actions is None:
             actions = self._simple_policy()
         self._apply_actions(actions)
         self._step_physics()
+        local_ready = self._phase_local_ready_map()
+        self._udp_broadcast_local_state(local_ready)
+        self._udp_poll()
         self._update_phase()
         obs = self._get_obs()
+        phase_sync_mean = (
+            float(statistics.fmean(self.phase_sync_delays_ms))
+            if self.phase_sync_delays_ms
+            else 0.0
+        )
         info = {
             "phase": self.phase.value,
             "time": self.sim_time,
@@ -270,6 +323,11 @@ class VlmCbfEnv:
             "carry_mode": self.active_carry_mode,
             "cbf": dict(self.cbf_stats),
             "grasp": dict(self.grasp_stats),
+            "phase_sync": {
+                "last_delay_ms": float(self.phase_sync_last_delay_ms),
+                "mean_delay_ms": phase_sync_mean,
+                "events": len(self.phase_sync_delays_ms),
+            },
         }
         return obs, info
 
@@ -441,7 +499,7 @@ class VlmCbfEnv:
                 base_id,
                 -1,
                 mass=self.cfg.base_mass,
-                lateralFriction=0.7 if spec.base_type == "diff" else 0.2,
+                lateralFriction=self.cfg.base_ground_friction,
                 rollingFriction=0.0,
                 spinningFriction=0.0,
                 physicsClientId=self.client_id,
@@ -454,7 +512,20 @@ class VlmCbfEnv:
                     physicsClientId=self.client_id,
                 )
             wheel_joints = self._wheel_joint_indices(base_id, spec.base_type)
+            wheel_friction = (
+                self.cfg.wheel_friction_diff
+                if spec.base_type == "diff"
+                else self.cfg.wheel_friction_omni
+            )
             for joint_idx in wheel_joints:
+                p.changeDynamics(
+                    base_id,
+                    joint_idx,
+                    lateralFriction=wheel_friction,
+                    rollingFriction=0.001,
+                    spinningFriction=0.001,
+                    physicsClientId=self.client_id,
+                )
                 p.setJointMotorControl2(
                     base_id,
                     joint_idx,
@@ -766,6 +837,22 @@ class VlmCbfEnv:
         if target is None:
             return (0.0, 0.0, 0.0)
         delta = target[:2] - base_pos[:2]
+        if self.phase == Phase.APPROACH and self.object_id is not None and self.object_spec is not None:
+            obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
+            obj_xy = np.array(obj_pos[:2], dtype=np.float32)
+            to_obj = base_pos[:2] - obj_xy
+            obj_dist = float(np.linalg.norm(to_obj) + 1e-6)
+            obj_radius = 0.5 * max(float(self.object_spec.dims[0]), float(self.object_spec.dims[1]))
+            avoid_radius = obj_radius + 0.45
+            if obj_dist < avoid_radius:
+                away = to_obj / obj_dist
+                avoid_gain = (avoid_radius - obj_dist) / max(avoid_radius, 1e-6)
+                # Repulsive and tangential components to avoid deadlocks at object boundary.
+                delta = delta + away * (0.8 * avoid_gain)
+                tangent = np.array([-away[1], away[0]], dtype=np.float32)
+                to_goal_from_obj = target[:2] - obj_xy
+                turn_sign = 1.0 if (away[0] * to_goal_from_obj[1] - away[1] * to_goal_from_obj[0]) >= 0.0 else -1.0
+                delta = delta + turn_sign * tangent * (0.25 * avoid_gain)
         dist = np.linalg.norm(delta)
         if dist < 1e-3:
             return (0.0, 0.0, 0.0)
@@ -777,14 +864,128 @@ class VlmCbfEnv:
     def _contact_force(self, robot: RobotInstance) -> float:
         if self.object_id is None:
             return 0.0
+        link_idx = robot.end_effector_link if robot.end_effector_link is not None else -1
         total_force = 0.0
         contacts = p.getContactPoints(
-            bodyA=robot.arm_id, bodyB=self.object_id, physicsClientId=self.client_id
+            bodyA=robot.arm_id,
+            bodyB=self.object_id,
+            linkIndexA=int(link_idx),
+            physicsClientId=self.client_id,
         )
         for contact in contacts:
             # contact[9] is normal force in PyBullet
             total_force += float(contact[9])
         return total_force
+
+    def _udp_poll(self) -> None:
+        if self.udp_bus is None:
+            return
+        packets = self.udp_bus.poll()
+        self.peer_packets = {
+            name: {
+                "phase": pkt.phase,
+                "ready": int(pkt.ready),
+                "sim_time": float(pkt.sim_time),
+                "pos": [float(pkt.pos[0]), float(pkt.pos[1])],
+                "vel": [float(pkt.vel[0]), float(pkt.vel[1])],
+            }
+            for name, pkt in packets.items()
+        }
+
+    def _phase_local_ready_map(self) -> Dict[str, int]:
+        ready: Dict[str, int] = {}
+        for robot in self.robots:
+            ready[robot.spec.name] = 1 if self._phase_local_ready(robot) else 0
+        return ready
+
+    def _phase_local_ready(self, robot: RobotInstance) -> bool:
+        if self.phase == Phase.APPROACH:
+            if robot.waypoint is None:
+                return False
+            pos, _ = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=self.client_id)
+            return np.linalg.norm(np.array(pos)[:2] - robot.waypoint[:2]) < self.cfg.phase_approach_dist
+
+        if self.phase == Phase.CONTACT:
+            if robot.constraint_id is not None:
+                return True
+            return self._contact_force(robot) >= self.cfg.phase_contact_force_threshold
+
+        if self.phase == Phase.LIFT:
+            obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
+            obj_vel, _ = p.getBaseVelocity(self.object_id, physicsClientId=self.client_id)
+            h_thresh = self.object_start_height + max(0.05, self.cfg.lift_height * 0.8)
+            stable = (
+                float(obj_pos[2]) >= float(h_thresh)
+                and abs(float(obj_vel[2])) <= self.cfg.phase_lift_vertical_speed_max
+            )
+            if stable:
+                if self._lift_stable_since is None:
+                    self._lift_stable_since = self.sim_time
+            else:
+                self._lift_stable_since = None
+            return bool(
+                self._lift_stable_since is not None
+                and (self.sim_time - self._lift_stable_since) >= self.cfg.phase_lift_stability_s
+            )
+
+        if self.phase == Phase.TRANSPORT:
+            return self._object_near_goal()
+
+        return False
+
+    def _phase_ready_count(self) -> int:
+        if self.phase not in (Phase.APPROACH, Phase.CONTACT, Phase.LIFT, Phase.TRANSPORT):
+            return 0
+        count = 0
+        for robot in self.robots:
+            pkt = self.peer_packets.get(robot.spec.name)
+            if pkt is None:
+                continue
+            if pkt.get("phase") != self.phase.value:
+                continue
+            if int(pkt.get("ready", 0)) == 1:
+                count += 1
+        return count
+
+    def _udp_broadcast_local_state(self, local_ready: Dict[str, int]) -> None:
+        if self.udp_bus is None:
+            return
+        for robot in self.robots:
+            pos, _ = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=self.client_id)
+            vel = self.last_safe_vel.get(robot.base_id, np.zeros(2, dtype=np.float32))
+            self.udp_bus.send(
+                sender=robot.spec.name,
+                phase=self.phase.value,
+                ready=int(local_ready.get(robot.spec.name, 0)),
+                sim_time=float(self.sim_time),
+                pos_xy=(float(pos[0]), float(pos[1])),
+                vel_xy=(float(vel[0]), float(vel[1])),
+            )
+
+    def _phase_consensus_ready(self) -> Tuple[bool, float]:
+        """
+        Returns:
+            (consensus_reached, sync_delay_seconds)
+        """
+        if self.phase not in (Phase.APPROACH, Phase.CONTACT, Phase.LIFT, Phase.TRANSPORT):
+            return False, 0.0
+        names = [robot.spec.name for robot in self.robots]
+        ready_times: List[float] = []
+        for name in names:
+            pkt = self.peer_packets.get(name)
+            if pkt is None:
+                return False, 0.0
+            if pkt.get("phase") != self.phase.value:
+                return False, 0.0
+            if int(pkt.get("ready", 0)) != 1:
+                return False, 0.0
+            ready_times.append(float(pkt.get("sim_time", -1e9)))
+        if not ready_times:
+            return False, 0.0
+        delay = max(ready_times) - min(ready_times)
+        if delay > self.cfg.phase_consensus_window_s:
+            return False, delay
+        return True, delay
 
     def _cbf_filter(self, robot: RobotInstance, v_des: np.ndarray) -> np.ndarray:
         self.cbf_stats["calls"] += 1
@@ -795,15 +996,26 @@ class VlmCbfEnv:
         for other in self.robots:
             if other.base_id == robot.base_id:
                 continue
-            pos_j, _ = p.getBasePositionAndOrientation(other.base_id, physicsClientId=self.client_id)
-            neighbor_pos.append(np.array(pos_j[:2], dtype=np.float32))
-            neighbor_vel.append(self.last_safe_vel.get(other.base_id, np.zeros(2, dtype=np.float32)))
+            peer = self.peer_packets.get(other.spec.name)
+            use_peer = (
+                self.cfg.use_udp_neighbor_state
+                and peer is not None
+                and (self.sim_time - float(peer.get("sim_time", -1e9))) <= self.cfg.udp_state_ttl_s
+            )
+            if use_peer:
+                neighbor_pos.append(np.array(peer["pos"], dtype=np.float32))
+                neighbor_vel.append(np.array(peer["vel"], dtype=np.float32))
+            else:
+                pos_j, _ = p.getBasePositionAndOrientation(other.base_id, physicsClientId=self.client_id)
+                neighbor_pos.append(np.array(pos_j[:2], dtype=np.float32))
+                neighbor_vel.append(self.last_safe_vel.get(other.base_id, np.zeros(2, dtype=np.float32)))
 
         eta = 1.0
         if self.cfg.use_ekf and self.object_belief is not None:
             eta = 1.0 + self.cfg.cbf_kappa * self.object_belief.uncertainty()
         v_max = self.cfg.speed_limit / max(eta, 1e-3)
-        d_min = self.cfg.separation_min * eta * self.cfg.cbf_risk_scale
+        d_min = self.cfg.separation_min * self.cfg.cbf_risk_scale
+        alpha_eff = self.cfg.cbf_alpha / max(eta, 1e-3)
 
         result = solve_cbf_qp(
             v_des=v_des,
@@ -812,7 +1024,9 @@ class VlmCbfEnv:
             neighbor_vel=neighbor_vel,
             v_max=v_max,
             d_min=d_min,
-            alpha=self.cfg.cbf_alpha,
+            alpha=alpha_eff,
+            slack_weight=self.cfg.cbf_slack_weight,
+            slack_max=self.cfg.cbf_slack_max,
         )
         v_safe = result.v_safe
 
@@ -852,7 +1066,10 @@ class VlmCbfEnv:
             self.last_safe_vel[robot.base_id] = np.array([vx, vy], dtype=np.float32)
 
             if self.cfg.use_ik and robot.end_effector_link >= 0:
-                self._apply_ik(robot)
+                if self.phase in (Phase.CONTACT, Phase.LIFT, Phase.TRANSPORT, Phase.PLACE):
+                    self._apply_ik(robot)
+                else:
+                    self._hold_arm_home(robot)
 
             robot.grip_active = action.grip
             if robot.grip_active:
@@ -892,15 +1109,29 @@ class VlmCbfEnv:
             )
             return
 
-        if not robot.wheel_joints:
+        use_wheel_drive = self.cfg.base_drive_mode == "wheel" and bool(robot.wheel_joints)
+        if not use_wheel_drive:
+            # Keep wheel angular velocity consistent with commanded chassis velocity
+            # so contact friction does not immediately cancel the commanded motion.
+            self._drive_wheels(robot, vx, vy, yaw_rate, yaw)
             p.resetBaseVelocity(
                 robot.base_id,
                 linearVelocity=[vx, vy, 0.0],
                 angularVelocity=[0.0, 0.0, yaw_rate],
                 physicsClientId=self.client_id,
             )
+            p.resetBaseVelocity(
+                robot.arm_id,
+                linearVelocity=[vx, vy, 0.0],
+                angularVelocity=[0.0, 0.0, yaw_rate],
+                physicsClientId=self.client_id,
+            )
             return
+        self._drive_wheels(robot, vx, vy, yaw_rate, yaw)
 
+    def _drive_wheels(self, robot: RobotInstance, vx: float, vy: float, yaw_rate: float, yaw: float) -> None:
+        if not robot.wheel_joints:
+            return
         wheel_r = self.cfg.wheel_radius
         half_w = self.cfg.track_width * 0.5
         half_l = self.cfg.wheel_base * 0.5
@@ -912,12 +1143,14 @@ class VlmCbfEnv:
             omega_left = (vx_body - yaw_rate * half_w) / wheel_r
             omega_right = (vx_body + yaw_rate * half_w) / wheel_r
             speeds = [omega_left, omega_right]
+            motor_force = float(self.cfg.wheel_motor_force_diff)
         else:
             omega_fl = (vx_body - vy_body - (half_l + half_w) * yaw_rate) / wheel_r
             omega_fr = (vx_body + vy_body + (half_l + half_w) * yaw_rate) / wheel_r
             omega_rl = (vx_body + vy_body - (half_l + half_w) * yaw_rate) / wheel_r
             omega_rr = (vx_body - vy_body + (half_l + half_w) * yaw_rate) / wheel_r
             speeds = [omega_fl, omega_fr, omega_rl, omega_rr]
+            motor_force = float(self.cfg.wheel_motor_force_omni)
 
         for joint_idx, target_vel in zip(robot.wheel_joints, speeds):
             p.setJointMotorControl2(
@@ -925,14 +1158,12 @@ class VlmCbfEnv:
                 joint_idx,
                 p.VELOCITY_CONTROL,
                 targetVelocity=float(target_vel),
-                force=200.0,
+                force=motor_force,
                 physicsClientId=self.client_id,
             )
 
     def _apply_ik(self, robot: RobotInstance) -> None:
         if self.object_id is None or self.object_spec is None:
-            return
-        if self.phase not in (Phase.CONTACT, Phase.LIFT, Phase.TRANSPORT, Phase.PLACE):
             return
         obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
         lift_offset = 0.0
@@ -969,6 +1200,24 @@ class VlmCbfEnv:
                 physicsClientId=self.client_id,
             )
 
+    def _hold_arm_home(self, robot: RobotInstance) -> None:
+        if not robot.joint_indices:
+            return
+        if robot.spec.dof >= 7:
+            home = [0.0, -0.7, 0.0, 1.3, 0.0, -0.8, 0.0]
+        else:
+            home = [0.0, -0.8, 0.0, 1.5, 0.0, 0.6]
+        for idx, joint_idx in enumerate(robot.joint_indices):
+            target = home[idx] if idx < len(home) else 0.0
+            p.setJointMotorControl2(
+                robot.arm_id,
+                joint_idx,
+                p.POSITION_CONTROL,
+                targetPosition=float(target),
+                force=600.0,
+                physicsClientId=self.client_id,
+            )
+
     def _maybe_attach(self, robot: RobotInstance) -> None:
         if robot.constraint_id is not None or self.object_id is None:
             return
@@ -983,11 +1232,21 @@ class VlmCbfEnv:
             linkIndexA=robot.end_effector_link,
             physicsClientId=self.client_id,
         )
+        parent_link = robot.end_effector_link
         if not closest:
-            return
+            closest = p.getClosestPoints(
+                bodyA=robot.arm_id,
+                bodyB=self.object_id,
+                distance=attach_dist * 2.0,
+                physicsClientId=self.client_id,
+            )
+            if not closest:
+                return
+            closest = sorted(closest, key=lambda c: float(c[8]))  # contact distance
+            parent_link = int(closest[0][3])
         robot.constraint_id = p.createConstraint(
             robot.arm_id,
-            robot.end_effector_link,
+            parent_link,
             self.object_id,
             -1,
             p.JOINT_FIXED,
@@ -1057,19 +1316,13 @@ class VlmCbfEnv:
         if self.object_id is None:
             return
         for robot in self.robots:
-            contacts = p.getContactPoints(
-                bodyA=robot.arm_id,
-                bodyB=self.object_id,
-                physicsClientId=self.client_id,
-            )
-            for contact in contacts:
-                normal_force = contact[9]
-                if self.cfg.sensor_force_noise > 0.0:
-                    normal_force += float(self.rng.normal(0.0, self.cfg.sensor_force_noise))
-                    normal_force = max(0.0, normal_force)
-                if normal_force > self.cfg.contact_force_max:
-                    self.violations["force"] += 1
-                    return
+            normal_force = self._contact_force(robot)
+            if self.cfg.sensor_force_noise > 0.0:
+                normal_force += float(self.rng.normal(0.0, self.cfg.sensor_force_noise))
+                normal_force = max(0.0, normal_force)
+            if normal_force > self.cfg.contact_force_max:
+                self.violations["force"] += 1
+                return
 
     def _maybe_fallback_carry_mode(self) -> None:
         if self.cfg.carry_mode != "auto":
@@ -1154,16 +1407,31 @@ class VlmCbfEnv:
         return True
 
     def _update_phase(self) -> None:
+        if self.cfg.use_udp_phase and self.udp_bus is not None:
+            self._update_phase_distributed()
+            return
+        self._update_phase_centralized()
+
+    def _update_phase_centralized(self) -> None:
         if self.phase == Phase.PLAN:
             self._plan_formation()
             self.phase = Phase.APPROACH
             self.phase_time = 0.0
             return
 
-        if self.phase == Phase.APPROACH and self._all_at_waypoints():
-            self.phase = Phase.CONTACT
-            self.phase_time = 0.0
-            return
+        if self.phase == Phase.APPROACH:
+            local_ready = self._phase_local_ready_map()
+            if all(v == 1 for v in local_ready.values()):
+                self.phase = Phase.CONTACT
+                self.phase_time = 0.0
+                return
+            if (
+                self.phase_time >= self.cfg.phase_approach_timeout_s
+                and sum(local_ready.values()) >= self.cfg.phase_approach_min_ready
+            ):
+                self.phase = Phase.CONTACT
+                self.phase_time = 0.0
+                return
 
         if self.phase == Phase.CONTACT and self._all_gripping():
             self.phase = Phase.LIFT
@@ -1184,6 +1452,58 @@ class VlmCbfEnv:
         if self.phase == Phase.PLACE and self.current_lift <= 1e-3:
             self.phase = Phase.DONE
             self.phase_time = 0.0
+
+    def _update_phase_distributed(self) -> None:
+        if self.phase == Phase.PLAN:
+            self._plan_formation()
+            self.phase = Phase.APPROACH
+            self.phase_time = 0.0
+            return
+        if self.phase == Phase.PLACE:
+            if self.current_lift <= 1e-3:
+                self.phase = Phase.DONE
+                self.phase_time = 0.0
+            return
+        if self.phase == Phase.DONE:
+            return
+
+        ready, delay = self._phase_consensus_ready()
+        if not ready:
+            # Timeout fallback for approach deadlocks: proceed if quorum reached.
+            if (
+                self.phase == Phase.APPROACH
+                and self.phase_time >= self.cfg.phase_approach_timeout_s
+                and self._phase_ready_count() >= self.cfg.phase_approach_min_ready
+            ):
+                self.phase_sync_last_delay_ms = float(self.cfg.phase_consensus_window_s * 1000.0)
+                self.phase_sync_delays_ms.append(self.phase_sync_last_delay_ms)
+                self.phase = Phase.CONTACT
+                self.phase_time = 0.0
+            return
+
+        self.phase_sync_last_delay_ms = float(delay * 1000.0)
+        self.phase_sync_delays_ms.append(self.phase_sync_last_delay_ms)
+
+        if self.phase == Phase.APPROACH:
+            self.phase = Phase.CONTACT
+            self.phase_time = 0.0
+            return
+
+        if self.phase == Phase.CONTACT:
+            self.phase = Phase.LIFT
+            self.phase_time = 0.0
+            return
+
+        if self.phase == Phase.LIFT:
+            self.phase = Phase.TRANSPORT
+            self.phase_time = 0.0
+            self._plan_goal_formation()
+            return
+
+        if self.phase == Phase.TRANSPORT:
+            self.phase = Phase.PLACE
+            self.phase_time = 0.0
+            return
 
     def _plan_formation(self) -> None:
         if self.object_id is None or self.object_spec is None:

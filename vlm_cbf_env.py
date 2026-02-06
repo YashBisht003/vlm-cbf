@@ -110,8 +110,8 @@ class TaskConfig:
     neural_cbf_hidden: int = 64
     neural_cbf_model_path: Optional[str] = None
     neural_cbf_device: str = "cpu"
-    neural_cbf_tighten_gain: float = 0.35
-    neural_cbf_sigmoid_gain: float = 3.0
+    neural_cbf_tighten_gain: float = 0.0
+    neural_cbf_sigmoid_gain: float = 0.0
     neural_cbf_alpha: float = 1.0
     neural_cbf_fd_eps: float = 1e-3
     neural_cbf_force_vel_gain: float = 4.0
@@ -1132,7 +1132,9 @@ class VlmCbfEnv:
                 normal_xy = np.zeros(2, dtype=np.float32)
 
             def _predict_force_n(v_xy: np.ndarray) -> float:
-                approach_speed = float(np.dot(v_xy, normal_xy))
+                obj_vel_xy = np.asarray(belief_mu[3:5], dtype=np.float32)
+                rel_v = np.asarray(v_xy, dtype=np.float32) - obj_vel_xy
+                approach_speed = float(np.dot(rel_v, normal_xy))
                 force_next = force_n0 + self.cfg.neural_cbf_force_vel_gain * self.control_dt * approach_speed
                 return float(np.clip(force_next, 0.0, 2.5))
 
@@ -1161,12 +1163,14 @@ class VlmCbfEnv:
                 rhs = float(np.dot(grad, v_ref) - (1.0 + self.cfg.neural_cbf_alpha) * neural_h_ref)
                 extra_linear.append((grad.copy(), rhs))
 
-            tighten = max(0.0, -neural_h_ref) * self.cfg.neural_cbf_tighten_gain
-            d_min *= 1.0 + tighten
-            v_max *= max(0.12, 1.0 - tighten)
-            gate_arg = float(np.clip(self.cfg.neural_cbf_sigmoid_gain * neural_h_ref, -20.0, 20.0))
-            gate = 1.0 / (1.0 + math.exp(-gate_arg))
-            v_max *= max(0.12, gate)
+            if self.cfg.neural_cbf_tighten_gain > 0.0:
+                tighten = max(0.0, -neural_h_ref) * self.cfg.neural_cbf_tighten_gain
+                d_min *= 1.0 + tighten
+                v_max *= max(0.12, 1.0 - tighten)
+            if self.cfg.neural_cbf_sigmoid_gain > 0.0:
+                gate_arg = float(np.clip(self.cfg.neural_cbf_sigmoid_gain * neural_h_ref, -20.0, 20.0))
+                gate = 1.0 / (1.0 + math.exp(-gate_arg))
+                v_max *= max(0.12, gate)
 
         result = solve_cbf_qp(
             v_des=v_des,
@@ -1191,7 +1195,8 @@ class VlmCbfEnv:
                 normal_xy = rel / rel_norm
             else:
                 normal_xy = np.zeros(2, dtype=np.float32)
-            approach_speed_safe = float(np.dot(v_safe, normal_xy))
+            obj_vel_xy = np.asarray(belief_mu[3:5], dtype=np.float32)
+            approach_speed_safe = float(np.dot(np.asarray(v_safe, dtype=np.float32) - obj_vel_xy, normal_xy))
             force_safe_n = float(
                 np.clip(
                     (contact_force / max(self.cfg.contact_force_max, 1e-6))

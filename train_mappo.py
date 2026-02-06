@@ -15,7 +15,6 @@ import torch.optim as optim
 
 from gnn_policy import CentralCritic, GnnPolicy
 from marl_obs import build_global_state, build_observation, global_state_dim, obs_dim
-from neural_cbf import neural_cbf_temporal_loss
 from train_logger import TrainLogger
 from vlm_cbf_env import Phase, RobotAction, TaskConfig, VlmCbfEnv
 
@@ -153,6 +152,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--neural-cbf-lr", type=float, default=1e-3, help="Neural CBF optimizer learning rate")
     parser.add_argument("--neural-cbf-epochs", type=int, default=2, help="Neural CBF update epochs per PPO update")
     parser.add_argument("--neural-cbf-margin", type=float, default=0.0, help="Margin for temporal neural CBF residual loss")
+    parser.add_argument(
+        "--neural-cbf-cls-lambda",
+        type=float,
+        default=0.25,
+        help="Weight of sign-classification regularizer on neural barrier output",
+    )
+    parser.add_argument(
+        "--neural-cbf-unsafe-weight",
+        type=float,
+        default=2.0,
+        help="Relative loss weight for unsafe temporal samples",
+    )
     parser.add_argument(
         "--neural-cbf-train-alpha",
         type=float,
@@ -507,6 +518,8 @@ def main() -> None:
         rollout_belief_unc = 0.0
         rollout_neural_x_prev: List[np.ndarray] = []
         rollout_neural_x_next: List[np.ndarray] = []
+        rollout_neural_safe: List[float] = []
+        rollout_neural_weight: List[float] = []
         prev_neural_by_robot: Dict[str, Tuple[np.ndarray, float]] = {}
         neural_loss_value = 0.0
         episode_successes = 0
@@ -561,9 +574,13 @@ def main() -> None:
                         prev_input, _h_prev = prev_sample
                         force_safe = float(robot_metrics.get("force_barrier_raw", -1.0)) >= 0.0
                         constraint_safe = float(robot_metrics.get("neural_constraint_margin", -1.0)) >= -1e-4
-                        if force_safe and constraint_safe and neural_input is not None:
+                        if neural_input is not None:
+                            safe_label = 1.0 if (force_safe and constraint_safe) else 0.0
+                            sample_weight = 1.0 if safe_label >= 0.5 else float(args.neural_cbf_unsafe_weight)
                             rollout_neural_x_prev.append(prev_input.astype(np.float32))
                             rollout_neural_x_next.append(np.asarray(neural_input, dtype=np.float32))
+                            rollout_neural_safe.append(float(safe_label))
+                            rollout_neural_weight.append(float(sample_weight))
                     if neural_input is not None:
                         prev_neural_by_robot[robot_name] = (np.asarray(neural_input, dtype=np.float32), h_curr)
                     else:
@@ -657,6 +674,8 @@ def main() -> None:
         if neural_cbf_opt is not None and env.neural_cbf is not None and rollout_neural_x_prev:
             x_prev_arr = np.stack(rollout_neural_x_prev).astype(np.float32)
             x_next_arr = np.stack(rollout_neural_x_next).astype(np.float32)
+            safe_arr = np.array(rollout_neural_safe, dtype=np.float32)
+            weight_arr = np.array(rollout_neural_weight, dtype=np.float32)
             idx = np.arange(x_prev_arr.shape[0])
             model = env.neural_cbf.model
             model.train()
@@ -668,14 +687,17 @@ def main() -> None:
                     batch_idx = idx[start : start + args.minibatch]
                     batch_x_prev = torch.tensor(x_prev_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
                     batch_x_next = torch.tensor(x_next_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
+                    batch_safe = torch.tensor(safe_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
+                    batch_w = torch.tensor(weight_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
                     h_prev = model(batch_x_prev)
                     h_next = model(batch_x_next)
-                    loss = neural_cbf_temporal_loss(
-                        h_prev=h_prev,
-                        h_next=h_next,
-                        alpha_dt=args.neural_cbf_train_alpha * env.control_dt,
-                        margin=args.neural_cbf_margin,
-                    )
+                    residual = h_next - h_prev + float(args.neural_cbf_train_alpha * env.control_dt) * h_prev
+                    residual_loss = torch.relu(float(args.neural_cbf_margin) - residual).pow(2)
+                    safe_pen = torch.relu(0.1 - h_next).pow(2)
+                    unsafe_pen = torch.relu(h_next + 0.1).pow(2)
+                    cls_pen = batch_safe * safe_pen + (1.0 - batch_safe) * unsafe_pen
+                    # Weight unsafe transitions more heavily to avoid safe-only bias.
+                    loss = (batch_w * (residual_loss + float(args.neural_cbf_cls_lambda) * cls_pen)).mean()
                     neural_cbf_opt.zero_grad()
                     loss.backward()
                     nn.utils.clip_grad_norm_(model.parameters(), 1.0)

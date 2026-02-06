@@ -62,6 +62,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--vacuum-break-dist", type=float, default=0.2, help="Vacuum break distance")
     parser.add_argument("--vacuum-force-margin", type=float, default=1.05, help="Vacuum force margin")
     parser.add_argument("--deterministic-eval", action="store_true", help="Deterministic policy eval")
+    parser.add_argument(
+        "--run-neural-ablation",
+        action="store_true",
+        help="Also evaluate learned policy with neural CBF disabled",
+    )
     parser.add_argument("--run-vlm-eval", action="store_true", help="Also run VLM formation evaluation")
     parser.add_argument("--vlm-model-id", default="llava-hf/llava-1.5-7b-hf", help="VLM model id for eval")
     parser.add_argument("--vlm-adapter", default="", help="LoRA adapter for VLM eval")
@@ -189,6 +194,7 @@ def main() -> None:
 
     train_csv = out_dir / "train_metrics.csv"
     eval_policy_csv = out_dir / "eval_learned_policy.csv"
+    eval_policy_no_neural_csv = out_dir / "eval_learned_policy_no_neural.csv"
     eval_heuristic_cbf_csv = out_dir / "eval_heuristic_cbf.csv"
     eval_heuristic_no_cbf_csv = out_dir / "eval_heuristic_no_cbf.csv"
     vlm_eval_json = out_dir / "vlm_eval_metrics.json"
@@ -288,6 +294,27 @@ def main() -> None:
     eval_policy_cmd.extend(shared_env_args)
     _run(eval_policy_cmd, repo_dir)
 
+    if args.run_neural_ablation:
+        eval_policy_no_neural_cmd = [
+            args.python,
+            "eval_policy_runs.py",
+            "--model",
+            str(policy_ckpt),
+            "--device",
+            args.device,
+            "--episodes",
+            str(args.episodes),
+            "--max-steps",
+            str(args.max_steps),
+            "--out",
+            str(eval_policy_no_neural_csv),
+            "--no-neural-cbf",
+        ]
+        if args.deterministic_eval:
+            eval_policy_no_neural_cmd.append("--deterministic")
+        eval_policy_no_neural_cmd.extend(shared_env_args)
+        _run(eval_policy_no_neural_cmd, repo_dir)
+
     eval_heuristic_cbf_cmd = [
         args.python,
         "eval_runs.py",
@@ -315,7 +342,10 @@ def main() -> None:
     eval_heuristic_no_cbf_cmd.extend(shared_env_args)
     _run(eval_heuristic_no_cbf_cmd, repo_dir)
 
-    for csv_path in [eval_policy_csv, eval_heuristic_cbf_csv, eval_heuristic_no_cbf_csv]:
+    plot_paths = [eval_policy_csv, eval_heuristic_cbf_csv, eval_heuristic_no_cbf_csv]
+    if args.run_neural_ablation:
+        plot_paths.append(eval_policy_no_neural_csv)
+    for csv_path in plot_paths:
         plot_cmd = [
             args.python,
             "plot_results.py",
@@ -350,11 +380,15 @@ def main() -> None:
             vlm_cmd.extend(["--model-path", args.vlm_model_path])
         _run(vlm_cmd, repo_dir)
 
-    summary_rows = [
-        _summarize_csv(eval_policy_csv, "learned_policy"),
-        _summarize_csv(eval_heuristic_cbf_csv, "heuristic_cbf"),
-        _summarize_csv(eval_heuristic_no_cbf_csv, "heuristic_no_cbf"),
-    ]
+    summary_rows = [_summarize_csv(eval_policy_csv, "learned_policy")]
+    if args.run_neural_ablation:
+        summary_rows.append(_summarize_csv(eval_policy_no_neural_csv, "learned_policy_no_neural"))
+    summary_rows.extend(
+        [
+            _summarize_csv(eval_heuristic_cbf_csv, "heuristic_cbf"),
+            _summarize_csv(eval_heuristic_no_cbf_csv, "heuristic_no_cbf"),
+        ]
+    )
     summary_csv = out_dir / "suite_summary.csv"
     summary_md = out_dir / "suite_summary.md"
     _write_summary_table(summary_rows, summary_csv, summary_md)

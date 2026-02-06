@@ -20,6 +20,7 @@ def _parse_args() -> argparse.Namespace:
         help="Select carry mode",
     )
     parser.add_argument("--no-cbf", action="store_true", help="Disable CBF/QP safety filter")
+    parser.add_argument("--no-neural-cbf", action="store_true", help="Disable neural force barrier in safety layer")
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
     parser.add_argument("--out", default="eval_results.csv", help="CSV output path")
     parser.add_argument(
@@ -215,6 +216,7 @@ def main() -> None:
         use_udp_neighbor_state=args.udp_neighbor_state,
         udp_base_port=args.udp_base_port,
         use_cbf=not args.no_cbf,
+        use_neural_cbf=not args.no_neural_cbf,
     )
     env = VlmCbfEnv(cfg)
     results = []

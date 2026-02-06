@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -30,12 +30,14 @@ def solve_cbf_qp(
     alpha: float,
     slack_weight: float = 100.0,
     slack_max: float = 3.0,
+    extra_linear: Optional[Sequence[Tuple[np.ndarray, float]]] = None,
 ) -> CbfResult:
     """
     Solve min ||v - v_des||^2 + w*s^2 subject to:
       |vx| <= v_max, |vy| <= v_max
       s >= 0
       2 (p_i - p_j)^T v_i + s >= -alpha * B_ij + 2 (p_i - p_j)^T v_j
+      a_k^T v_i + s >= b_k, for each extra linearized CBF constraint
     """
     v_des = np.asarray(v_des, dtype=np.float64).reshape(2)
     pos_i = np.asarray(pos_i, dtype=np.float64).reshape(2)
@@ -76,6 +78,13 @@ def solve_cbf_qp(
         A_rows.append([2.0 * delta[0], 2.0 * delta[1], 1.0])
         l.append(rhs)
         u.append(np.inf)
+
+    if extra_linear is not None:
+        for coeff, rhs in extra_linear:
+            coeff = np.asarray(coeff, dtype=np.float64).reshape(2)
+            A_rows.append([float(coeff[0]), float(coeff[1]), 1.0])
+            l.append(float(rhs))
+            u.append(np.inf)
 
     A = sparse.csc_matrix(np.array(A_rows, dtype=np.float64))
     l = np.array(l, dtype=np.float64)

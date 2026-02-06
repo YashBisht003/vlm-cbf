@@ -203,6 +203,13 @@ If the solver fails, the robot executes a monitored stop (safe fallback).
 The QP includes a slack variable for feasibility and clips final velocity to
 the ISO speed norm bound.
 
+Neural force barrier integration (`h_phi([F_i, mu_b, Sigma_b])`):
+- The neural barrier is evaluated from force + EKF belief.
+- A linearized neural-CBF inequality is added to the same QP (`a^T v + s >= b`).
+- The same barrier also tightens speed/separation adaptively under high risk.
+- Online neural-CBF training uses temporal rollout labels (CBF residual across
+  consecutive steps), not only static per-step labels.
+
 ## Distributed Phase + UDP
 Phase synchronization supports a UDP peer-broadcast mode:
 - `use_udp_phase=True`
@@ -211,6 +218,8 @@ Phase synchronization supports a UDP peer-broadcast mode:
 
 This keeps phase voting and neighbor-state exchange out of a centralized loop
 and logs phase sync delay metrics in `info["phase_sync"]`.
+Execution is decentralized but communication-enabled (lightweight P2P UDP),
+not communication-free.
 
 ## Vacuum End Effector Model
 `carry_mode="constraint"` uses a vacuum-style fixed constraint per end effector.
@@ -291,6 +300,12 @@ If you change these settings, regenerate the dataset before training.
 - CPU VLM (`train_vlm_cpu.py`) is a lightweight proxy, not a replacement for LLaVA fine-tuning.
 - If no VLM output is provided, the environment still falls back to geometric formation.
 - Reproduce VLM claims from this repo using `train_vlm_llava_lora.py` + `eval_vlm_formations.py` on a fixed split.
+- The neural CBF currently uses a linearized inequality in QP plus adaptive
+  tightening; this is a practical implementation, not a full formal proof
+  pipeline for forward invariance.
+- Online neural-CBF training is rollout-supervised from temporal safety
+  residuals and force constraints; for stronger claims, use a dedicated
+  safe/unsafe dataset and ablation protocol.
 - Default `carry_mode="auto"` tries suction constraints first and falls back to
   kinematic carry if attachment does not stabilize within a short window.
 - `carry_mode="constraint"` is the most physically faithful, but may need tuning

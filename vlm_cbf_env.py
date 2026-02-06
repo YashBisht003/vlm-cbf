@@ -111,6 +111,10 @@ class TaskConfig:
     neural_cbf_device: str = "cpu"
     neural_cbf_tighten_gain: float = 0.35
     neural_cbf_sigmoid_gain: float = 3.0
+    neural_cbf_use_qp_constraint: bool = True
+    neural_cbf_alpha: float = 1.0
+    neural_cbf_fd_eps: float = 1e-3
+    neural_cbf_force_vel_gain: float = 4.0
 
     use_udp_phase: bool = True
     use_udp_neighbor_state: bool = True
@@ -263,6 +267,7 @@ class VlmCbfEnv:
             "speed_barrier_norm_min": 1.0,
             "force_barrier_norm_min": 1.0,
             "neural_barrier_min": 1.0,
+            "neural_constraint_margin_min": 1.0,
         }
         self.grasp_stats: Dict[str, int] = {
             "attach_attempts": 0,
@@ -1097,19 +1102,62 @@ class VlmCbfEnv:
         contact_force_max_eff = self.cfg.contact_force_max / max(eta_force, 1e-3)
 
         neural_h = 1.0
+        neural_h_ref = 1.0
+        neural_h_safe = 1.0
         neural_input: Optional[np.ndarray] = None
+        neural_constraint_margin = 1.0
+        extra_linear: List[Tuple[np.ndarray, float]] = []
         if self.cfg.use_neural_cbf and self.neural_cbf is not None:
-            neural_eval = self.neural_cbf.eval_barrier(
-                force_n=contact_force / max(self.cfg.contact_force_max, 1e-6),
-                belief_mu=belief_mu,
-                belief_cov=belief_cov,
-            )
+            force_n0 = contact_force / max(self.cfg.contact_force_max, 1e-6)
+            neural_eval = self.neural_cbf.eval_barrier(force_n=force_n0, belief_mu=belief_mu, belief_cov=belief_cov)
             neural_h = float(neural_eval.h_value) / max(eta_neural, 1e-3)
+            neural_h_ref = neural_h
             neural_input = neural_eval.features
-            tighten = max(0.0, -neural_h) * self.cfg.neural_cbf_tighten_gain
+
+            obj_pos_world, _ = self._get_object_pose(noisy=False)
+            obj_xy = np.array(obj_pos_world[:2], dtype=np.float32)
+            rel = obj_xy - pos_i
+            rel_norm = float(np.linalg.norm(rel))
+            if rel_norm > 1e-6:
+                normal_xy = rel / rel_norm
+            else:
+                normal_xy = np.zeros(2, dtype=np.float32)
+
+            def _predict_force_n(v_xy: np.ndarray) -> float:
+                approach_speed = float(np.dot(v_xy, normal_xy))
+                force_next = force_n0 + self.cfg.neural_cbf_force_vel_gain * self.control_dt * approach_speed
+                return float(np.clip(force_next, 0.0, 2.5))
+
+            def _neural_h_for_velocity(v_xy: np.ndarray) -> float:
+                eval_out = self.neural_cbf.eval_barrier(
+                    force_n=_predict_force_n(v_xy),
+                    belief_mu=belief_mu,
+                    belief_cov=belief_cov,
+                )
+                return float(eval_out.h_value) / max(eta_neural, 1e-3)
+
+            v_ref = np.asarray(v_des, dtype=np.float32).reshape(2)
+            neural_h_ref = _neural_h_for_velocity(v_ref)
+            neural_h = neural_h_ref
+
+            if self.cfg.neural_cbf_use_qp_constraint:
+                fd_eps = max(float(self.cfg.neural_cbf_fd_eps), 1e-5)
+                grad = np.zeros(2, dtype=np.float32)
+                for axis in range(2):
+                    delta = np.zeros(2, dtype=np.float32)
+                    delta[axis] = fd_eps
+                    h_plus = _neural_h_for_velocity(v_ref + delta)
+                    h_minus = _neural_h_for_velocity(v_ref - delta)
+                    grad[axis] = (h_plus - h_minus) / (2.0 * fd_eps)
+                grad_norm = float(np.linalg.norm(grad))
+                if grad_norm > 1e-7:
+                    rhs = float(np.dot(grad, v_ref) - (1.0 + self.cfg.neural_cbf_alpha) * neural_h_ref)
+                    extra_linear.append((grad.copy(), rhs))
+
+            tighten = max(0.0, -neural_h_ref) * self.cfg.neural_cbf_tighten_gain
             d_min *= 1.0 + tighten
             v_max *= max(0.12, 1.0 - tighten)
-            gate_arg = float(np.clip(self.cfg.neural_cbf_sigmoid_gain * neural_h, -20.0, 20.0))
+            gate_arg = float(np.clip(self.cfg.neural_cbf_sigmoid_gain * neural_h_ref, -20.0, 20.0))
             gate = 1.0 / (1.0 + math.exp(-gate_arg))
             v_max *= max(0.12, gate)
 
@@ -1123,8 +1171,38 @@ class VlmCbfEnv:
             alpha=alpha_eff,
             slack_weight=slack_weight,
             slack_max=slack_max,
+            extra_linear=extra_linear,
         )
         v_safe = result.v_safe
+
+        if self.cfg.use_neural_cbf and self.neural_cbf is not None:
+            obj_pos_world, _ = self._get_object_pose(noisy=False)
+            obj_xy = np.array(obj_pos_world[:2], dtype=np.float32)
+            rel = obj_xy - pos_i
+            rel_norm = float(np.linalg.norm(rel))
+            if rel_norm > 1e-6:
+                normal_xy = rel / rel_norm
+            else:
+                normal_xy = np.zeros(2, dtype=np.float32)
+            approach_speed_safe = float(np.dot(v_safe, normal_xy))
+            force_safe_n = float(
+                np.clip(
+                    (contact_force / max(self.cfg.contact_force_max, 1e-6))
+                    + self.cfg.neural_cbf_force_vel_gain * self.control_dt * approach_speed_safe,
+                    0.0,
+                    2.5,
+                )
+            )
+            neural_safe_eval = self.neural_cbf.eval_barrier(
+                force_n=force_safe_n,
+                belief_mu=belief_mu,
+                belief_cov=belief_cov,
+            )
+            neural_h_safe = float(neural_safe_eval.h_value) / max(eta_neural, 1e-3)
+            neural_h = min(neural_h_ref, neural_h_safe)
+            if extra_linear:
+                coeff, rhs = extra_linear[0]
+                neural_constraint_margin = float(np.dot(coeff, v_safe) - rhs)
 
         if not result.success:
             # fallback: monitored stop
@@ -1157,6 +1235,9 @@ class VlmCbfEnv:
             "speed_barrier_norm": float(speed_norm),
             "force_barrier_norm": float(force_norm),
             "neural_barrier": float(neural_h),
+            "neural_barrier_ref": float(neural_h_ref),
+            "neural_barrier_safe": float(neural_h_safe),
+            "neural_constraint_margin": float(neural_constraint_margin),
             "sep_barrier_raw": float(sep_barrier_min),
             "speed_barrier_raw": float(speed_barrier),
             "force_barrier_raw": float(force_barrier),
@@ -1210,6 +1291,7 @@ class VlmCbfEnv:
                 "speed_barrier_norm_min": float(min(m["speed_barrier_norm"] for m in metrics)),
                 "force_barrier_norm_min": float(min(m["force_barrier_norm"] for m in metrics)),
                 "neural_barrier_min": float(min(m["neural_barrier"] for m in metrics)),
+                "neural_constraint_margin_min": float(min(m["neural_constraint_margin"] for m in metrics)),
             }
         else:
             self.cbf_last_summary = {
@@ -1218,6 +1300,7 @@ class VlmCbfEnv:
                 "speed_barrier_norm_min": 1.0,
                 "force_barrier_norm_min": 1.0,
                 "neural_barrier_min": 1.0,
+                "neural_constraint_margin_min": 1.0,
             }
 
     def _apply_base_motion(self, robot: RobotInstance, vx: float, vy: float, yaw_rate: float) -> None:

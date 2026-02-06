@@ -15,6 +15,7 @@ import torch.optim as optim
 
 from gnn_policy import CentralCritic, GnnPolicy
 from marl_obs import build_observation, obs_dim
+from neural_cbf import neural_cbf_loss
 from train_logger import TrainLogger
 from vlm_cbf_env import Phase, RobotAction, TaskConfig, VlmCbfEnv
 
@@ -107,6 +108,37 @@ def _parse_args() -> argparse.Namespace:
         help="Disable UDP neighbor state in CBF",
     )
     parser.add_argument("--udp-base-port", type=int, default=39000, help="Base UDP port for robot peers")
+    parser.add_argument("--cbf-risk-s-speed", type=float, default=1.0, help="Risk severity for speed CBF")
+    parser.add_argument("--cbf-risk-s-sep", type=float, default=1.0, help="Risk severity for separation CBF")
+    parser.add_argument("--cbf-risk-s-force", type=float, default=1.0, help="Risk severity for force CBF")
+    parser.add_argument("--cbf-risk-s-neural", type=float, default=1.0, help="Risk severity for neural CBF")
+    parser.add_argument(
+        "--neural-cbf",
+        dest="use_neural_cbf",
+        action="store_true",
+        help="Enable neural force barrier h_phi(s,b) (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-neural-cbf",
+        dest="use_neural_cbf",
+        action="store_false",
+        help="Disable neural force barrier",
+    )
+    parser.add_argument("--neural-cbf-model", default="", help="Path to neural CBF model checkpoint")
+    parser.add_argument("--neural-cbf-hidden", type=int, default=64, help="Neural CBF hidden size")
+    parser.add_argument("--neural-cbf-device", default="cpu", help="Device for neural CBF runtime")
+
+    parser.add_argument("--cbf-epsilon", type=float, default=0.2, help="Barrier shaping epsilon")
+    parser.add_argument("--w-cbf-prox", type=float, default=0.2, help="Weight for CBF proximity penalty")
+    parser.add_argument("--w-int", type=float, default=0.05, help="Weight for CBF intervention penalty")
+    parser.add_argument("--w-force-balance", type=float, default=0.05, help="Weight for force balance penalty")
+    parser.add_argument("--w-tilt", type=float, default=0.1, help="Weight for object tilt penalty")
+    parser.add_argument("--w-neural", type=float, default=0.05, help="Weight for neural barrier term")
+    parser.add_argument("--train-neural-cbf", action="store_true", help="Train neural CBF online from rollout data")
+    parser.add_argument("--neural-cbf-lr", type=float, default=1e-3, help="Neural CBF optimizer learning rate")
+    parser.add_argument("--neural-cbf-epochs", type=int, default=2, help="Neural CBF update epochs per PPO update")
+    parser.add_argument("--neural-cbf-margin", type=float, default=0.2, help="Margin for neural CBF loss")
+
     parser.add_argument("--out", default="mappo_policy.pt", help="Final checkpoint path")
     parser.add_argument("--checkpoint-dir", default="checkpoints", help="Directory for periodic checkpoints")
     parser.add_argument("--save-every", type=int, default=25, help="Checkpoint cadence (updates)")
@@ -146,7 +178,13 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-steps", type=int, default=4000, help="Max steps per episode")
     parser.add_argument("--log-csv", default="train_metrics.csv", help="CSV log output")
-    parser.set_defaults(save_latest=True, verify_checkpoints=True, udp_phase=True, udp_neighbor_state=True)
+    parser.set_defaults(
+        save_latest=True,
+        verify_checkpoints=True,
+        udp_phase=True,
+        udp_neighbor_state=True,
+        use_neural_cbf=True,
+    )
     return parser.parse_args()
 
 
@@ -174,7 +212,7 @@ def _mean_distance(points_a: List[np.ndarray], points_b: List[np.ndarray]) -> fl
     return float(np.mean(dists)) if dists else 0.0
 
 
-def _compute_reward(env: VlmCbfEnv, prev_viol: Dict[str, int]) -> Tuple[float, Dict[str, int]]:
+def _compute_reward(env: VlmCbfEnv, info: Dict, prev_viol: Dict[str, int], args: argparse.Namespace) -> Tuple[float, Dict[str, int]]:
     obj_pos, _ = env._get_object_pose(noisy=False)
     obj_pos = np.array(obj_pos, dtype=np.float32)
     reward = -0.01
@@ -204,6 +242,34 @@ def _compute_reward(env: VlmCbfEnv, prev_viol: Dict[str, int]) -> Tuple[float, D
     delta_sep = env.violations["separation"] - prev_viol.get("separation", 0)
     delta_force = env.violations["force"] - prev_viol.get("force", 0)
     reward -= 0.05 * delta_speed + 0.1 * delta_sep + 0.1 * delta_force
+
+    cbf_info = info.get("cbf", {})
+    eps = max(float(args.cbf_epsilon), 1e-6)
+    neural_barrier_raw = float(cbf_info.get("neural_barrier_min", 1.0))
+    neural_barrier = float(np.tanh(neural_barrier_raw))
+    barrier_vals = [
+        float(cbf_info.get("sep_barrier_norm_min", 1.0)),
+        float(cbf_info.get("speed_barrier_norm_min", 1.0)),
+        float(cbf_info.get("force_barrier_norm_min", 1.0)),
+        neural_barrier,
+    ]
+    prox_penalty = 0.0
+    for value in barrier_vals:
+        prox_penalty += (max(0.0, eps - value) / eps) ** 2
+    reward -= float(args.w_cbf_prox) * prox_penalty
+
+    intervention_pen = float(cbf_info.get("intervention_l2", 0.0))
+    reward -= float(args.w_int) * intervention_pen
+    reward += float(args.w_neural) * neural_barrier
+
+    if env.phase in (Phase.CONTACT, Phase.LIFT, Phase.TRANSPORT):
+        forces = np.array(info.get("contact_forces", []), dtype=np.float32)
+        if forces.size > 0:
+            force_norm = forces / max(env.cfg.contact_force_max, 1e-6)
+            reward -= float(args.w_force_balance) * float(np.var(force_norm))
+
+    if env.phase in (Phase.LIFT, Phase.TRANSPORT, Phase.PLACE):
+        reward -= float(args.w_tilt) * float(info.get("object_tilt_rad", 0.0))
 
     return float(reward), dict(env.violations)
 
@@ -298,9 +364,21 @@ def main() -> None:
         use_udp_phase=args.udp_phase,
         use_udp_neighbor_state=args.udp_neighbor_state,
         udp_base_port=args.udp_base_port,
+        cbf_risk_s_speed=args.cbf_risk_s_speed,
+        cbf_risk_s_sep=args.cbf_risk_s_sep,
+        cbf_risk_s_force=args.cbf_risk_s_force,
+        cbf_risk_s_neural=args.cbf_risk_s_neural,
+        use_neural_cbf=args.use_neural_cbf,
+        neural_cbf_model_path=(args.neural_cbf_model if args.neural_cbf_model else None),
+        neural_cbf_hidden=args.neural_cbf_hidden,
+        neural_cbf_device=args.neural_cbf_device,
+        cbf_eps=args.cbf_epsilon,
     )
     env = VlmCbfEnv(cfg)
     env.reset()
+    neural_cbf_opt: Optional[optim.Optimizer] = None
+    if args.train_neural_cbf and cfg.use_neural_cbf and env.neural_cbf is not None:
+        neural_cbf_opt = optim.Adam(env.neural_cbf.model.parameters(), lr=args.neural_cbf_lr)
 
     n_agents = len(env.robots)
     policy = GnnPolicy(obs_dim(), hidden=128, msg_dim=128, layers=3).to(device)
@@ -382,6 +460,13 @@ def main() -> None:
         rollout_cbf_modified = 0
         rollout_cbf_fallback = 0
         rollout_cbf_force_stop = 0
+        rollout_int_l2 = 0.0
+        rollout_cbf_prox = 0.0
+        rollout_force_balance = 0.0
+        rollout_tilt = 0.0
+        rollout_neural_x: List[np.ndarray] = []
+        rollout_neural_y: List[float] = []
+        neural_loss_value = 0.0
         episode_successes = 0
         episode_count = 0
         prev_viol = dict(env.violations)
@@ -398,13 +483,31 @@ def main() -> None:
 
             actions = _to_actions(act_out.action.cpu().numpy(), env)
             _obs, info = env.step(actions)
-            reward, prev_viol = _compute_reward(env, prev_viol)
+            reward, prev_viol = _compute_reward(env, info, prev_viol, args)
             done = float(info["phase"] == "done")
             cbf = info.get("cbf", {})
             rollout_cbf_calls += int(cbf.get("calls", 0))
             rollout_cbf_modified += int(cbf.get("modified", 0))
             rollout_cbf_fallback += int(cbf.get("fallback", 0))
             rollout_cbf_force_stop += int(cbf.get("force_stop", 0))
+            rollout_int_l2 += float(cbf.get("intervention_l2", 0.0))
+            eps = max(float(args.cbf_epsilon), 1e-6)
+            rollout_cbf_prox += (max(0.0, eps - float(cbf.get("sep_barrier_norm_min", 1.0))) / eps) ** 2
+            rollout_cbf_prox += (max(0.0, eps - float(cbf.get("speed_barrier_norm_min", 1.0))) / eps) ** 2
+            rollout_cbf_prox += (max(0.0, eps - float(cbf.get("force_barrier_norm_min", 1.0))) / eps) ** 2
+            rollout_cbf_prox += (max(0.0, eps - float(np.tanh(float(cbf.get("neural_barrier_min", 1.0))))) / eps) ** 2
+            forces = np.array(info.get("contact_forces", []), dtype=np.float32)
+            if forces.size > 0:
+                rollout_force_balance += float(np.var(forces / max(env.cfg.contact_force_max, 1e-6)))
+            rollout_tilt += float(info.get("object_tilt_rad", 0.0))
+            if neural_cbf_opt is not None:
+                for robot_metrics in env.cbf_step_metrics.values():
+                    neural_input = robot_metrics.get("neural_input")
+                    if neural_input is None:
+                        continue
+                    rollout_neural_x.append(np.asarray(neural_input, dtype=np.float32))
+                    safe_label = 1.0 if float(robot_metrics.get("force_barrier_raw", -1.0)) >= 0.0 else 0.0
+                    rollout_neural_y.append(float(safe_label))
 
             rollout_obs.append(obs)
             rollout_pos.append(pos)
@@ -487,6 +590,33 @@ def main() -> None:
             nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
             critic_opt.step()
 
+        if neural_cbf_opt is not None and env.neural_cbf is not None and rollout_neural_x:
+            x_arr = np.stack(rollout_neural_x).astype(np.float32)
+            y_arr = np.array(rollout_neural_y, dtype=np.float32)
+            idx = np.arange(x_arr.shape[0])
+            model = env.neural_cbf.model
+            model.train()
+            loss_acc = 0.0
+            loss_count = 0
+            for _ in range(max(1, args.neural_cbf_epochs)):
+                rng.shuffle(idx)
+                for start in range(0, len(idx), args.minibatch):
+                    batch_idx = idx[start : start + args.minibatch]
+                    batch_x = torch.tensor(x_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
+                    batch_y = torch.tensor(y_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
+                    h_values = model(batch_x)
+                    loss = neural_cbf_loss(h_values=h_values, safe_labels=batch_y, margin=args.neural_cbf_margin)
+                    neural_cbf_opt.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    neural_cbf_opt.step()
+                    loss_acc += float(loss.item())
+                    loss_count += 1
+            model.eval()
+            neural_loss_value = loss_acc / max(loss_count, 1)
+            if args.neural_cbf_model:
+                env.neural_cbf.save(args.neural_cbf_model)
+
         current_metric = float(episode_successes / max(episode_count, 1))
         if args.best_metric == "mean_reward":
             current_metric = float(np.mean(rollout_rewards))
@@ -545,6 +675,11 @@ def main() -> None:
                 "cbf_fallback": float(rollout_cbf_fallback),
                 "cbf_force_stop": float(rollout_cbf_force_stop),
                 "cbf_rate": float(cbf_rate),
+                "cbf_intervention_l2": float(rollout_int_l2 / max(steps, 1)),
+                "cbf_proximity": float(rollout_cbf_prox / max(steps, 1)),
+                "force_balance_var": float(rollout_force_balance / max(steps, 1)),
+                "object_tilt_mean": float(rollout_tilt / max(steps, 1)),
+                "neural_cbf_loss": float(neural_loss_value),
                 "update_sec": float(time.time() - update_start_t),
             }
         )
@@ -553,7 +688,8 @@ def main() -> None:
             print(
                 f"Update {update}/{args.updates} | mean reward {np.mean(rollout_rewards):.3f} | "
                 f"value loss {value_loss.item():.4f} | actor loss {actor_loss.item():.4f} | "
-                f"cbf rate {cbf_rate:.3f} | {time.time() - update_start_t:.2f}s/update"
+                f"cbf rate {cbf_rate:.3f} | neural cbf loss {neural_loss_value:.4f} | "
+                f"{time.time() - update_start_t:.2f}s/update"
             )
 
     env.close()

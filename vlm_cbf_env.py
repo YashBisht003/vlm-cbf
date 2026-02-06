@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover - optional fallback
 
 from belief_ekf import BeliefEKF
 from cbf_qp import solve_cbf_qp
+from neural_cbf import NeuralCbfRuntime
 from p2p_udp import UdpPeerBus
 
 
@@ -91,10 +92,25 @@ class TaskConfig:
     cbf_risk_scale: float = 1.0
     cbf_slack_weight: float = 100.0
     cbf_slack_max: float = 3.0
+    cbf_risk_s_speed: float = 1.0
+    cbf_risk_s_sep: float = 1.0
+    cbf_risk_s_force: float = 1.0
+    cbf_risk_s_neural: float = 1.0
+    cbf_eps: float = 0.2
     use_ekf: bool = True
     ekf_q_pos: float = 1e-3
     ekf_q_vel: float = 1e-2
+    ekf_q_theta: float = 5e-4
+    ekf_q_omega: float = 2e-3
     ekf_r_meas: float = 5e-3
+    ekf_r_yaw: float = 2e-3
+
+    use_neural_cbf: bool = True
+    neural_cbf_hidden: int = 64
+    neural_cbf_model_path: Optional[str] = None
+    neural_cbf_device: str = "cpu"
+    neural_cbf_tighten_gain: float = 0.35
+    neural_cbf_sigmoid_gain: float = 3.0
 
     use_udp_phase: bool = True
     use_udp_neighbor_state: bool = True
@@ -240,6 +256,14 @@ class VlmCbfEnv:
         self.goal_waypoints: Optional[List[np.ndarray]] = None
         self.violations: Dict[str, int] = {"speed": 0, "separation": 0, "force": 0}
         self.cbf_stats: Dict[str, int] = {"calls": 0, "modified": 0, "fallback": 0, "force_stop": 0}
+        self.cbf_step_metrics: Dict[str, dict] = {}
+        self.cbf_last_summary: Dict[str, float] = {
+            "intervention_l2": 0.0,
+            "sep_barrier_norm_min": 1.0,
+            "speed_barrier_norm_min": 1.0,
+            "force_barrier_norm_min": 1.0,
+            "neural_barrier_min": 1.0,
+        }
         self.grasp_stats: Dict[str, int] = {
             "attach_attempts": 0,
             "attach_success": 0,
@@ -257,6 +281,8 @@ class VlmCbfEnv:
         self.podium_height: float = self.cfg.podium_size[2]
         self.last_safe_vel: Dict[int, np.ndarray] = {}
         self.object_belief: Optional[BeliefEKF] = None
+        if not hasattr(self, "neural_cbf"):
+            self.neural_cbf: Optional[NeuralCbfRuntime] = None
         self.object_start_height: float = 0.0
         self._lift_stable_since: Optional[float] = None
         self.udp_bus: Optional[UdpPeerBus] = None
@@ -277,10 +303,29 @@ class VlmCbfEnv:
                 dt=self.control_dt,
                 q_pos=self.cfg.ekf_q_pos,
                 q_vel=self.cfg.ekf_q_vel,
+                q_theta=self.cfg.ekf_q_theta,
+                q_omega=self.cfg.ekf_q_omega,
                 r_meas=self.cfg.ekf_r_meas,
+                r_yaw=self.cfg.ekf_r_yaw,
             )
-            obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
-            self.object_belief.update((float(obj_pos[0]), float(obj_pos[1])))
+            obj_pos, obj_quat = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
+            obj_yaw = _yaw_from_quat(obj_quat)
+            self.object_belief.update((float(obj_pos[0]), float(obj_pos[1]), float(obj_yaw)))
+        if self.cfg.use_neural_cbf and self.neural_cbf is None:
+            try:
+                self.neural_cbf = NeuralCbfRuntime(
+                    mu_dim=6,
+                    hidden=self.cfg.neural_cbf_hidden,
+                    model_path=self.cfg.neural_cbf_model_path,
+                    device=self.cfg.neural_cbf_device,
+                )
+            except FileNotFoundError:
+                self.neural_cbf = NeuralCbfRuntime(
+                    mu_dim=6,
+                    hidden=self.cfg.neural_cbf_hidden,
+                    model_path=None,
+                    device=self.cfg.neural_cbf_device,
+                )
         obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
         self.object_start_height = float(obj_pos[2])
         if self.cfg.use_udp_phase or self.cfg.use_udp_neighbor_state:
@@ -311,6 +356,11 @@ class VlmCbfEnv:
         self._udp_poll()
         self._update_phase()
         obs = self._get_obs()
+        obj_pos, obj_quat = self._get_object_pose(noisy=False)
+        obj_roll, obj_pitch, _obj_yaw = p.getEulerFromQuaternion(obj_quat)
+        tilt = float(np.sqrt(obj_roll * obj_roll + obj_pitch * obj_pitch))
+        contact_forces = [float(self._contact_force(robot)) for robot in self.robots]
+        belief_mean, belief_cov = self._belief_snapshot()
         phase_sync_mean = (
             float(statistics.fmean(self.phase_sync_delays_ms))
             if self.phase_sync_delays_ms
@@ -321,8 +371,15 @@ class VlmCbfEnv:
             "time": self.sim_time,
             "violations": dict(self.violations),
             "carry_mode": self.active_carry_mode,
-            "cbf": dict(self.cbf_stats),
+            "cbf": {**dict(self.cbf_stats), **dict(self.cbf_last_summary)},
             "grasp": dict(self.grasp_stats),
+            "contact_forces": contact_forces,
+            "object_tilt_rad": tilt,
+            "belief": {
+                "mu": belief_mean.tolist(),
+                "cov_diag": np.diag(belief_cov).astype(np.float32).tolist(),
+                "uncertainty_pos": float(np.sqrt(max(0.0, np.trace(belief_cov[:2, :2])))),
+            },
             "phase_sync": {
                 "last_delay_ms": float(self.phase_sync_last_delay_ms),
                 "mean_delay_ms": phase_sync_mean,
@@ -864,12 +921,10 @@ class VlmCbfEnv:
     def _contact_force(self, robot: RobotInstance) -> float:
         if self.object_id is None:
             return 0.0
-        link_idx = robot.end_effector_link if robot.end_effector_link is not None else -1
         total_force = 0.0
         contacts = p.getContactPoints(
             bodyA=robot.arm_id,
             bodyB=self.object_id,
-            linkIndexA=int(link_idx),
             physicsClientId=self.client_id,
         )
         for contact in contacts:
@@ -987,6 +1042,20 @@ class VlmCbfEnv:
             return False, delay
         return True, delay
 
+    def _belief_snapshot(self) -> Tuple[np.ndarray, np.ndarray]:
+        if self.cfg.use_ekf and self.object_belief is not None:
+            mu = self.object_belief.mean().astype(np.float32)
+            cov = self.object_belief.covariance().astype(np.float32)
+            return mu, cov
+        obj_pos, obj_quat = self._get_object_pose(noisy=False)
+        obj_yaw = _yaw_from_quat(obj_quat)
+        mu = np.array([obj_pos[0], obj_pos[1], obj_yaw, 0.0, 0.0, 0.0], dtype=np.float32)
+        cov = np.eye(6, dtype=np.float32) * 1e-3
+        return mu, cov
+
+    def _risk_factor(self, severity: float, metric: float) -> float:
+        return float(1.0 + self.cfg.cbf_kappa * max(0.0, severity) * max(0.0, metric))
+
     def _cbf_filter(self, robot: RobotInstance, v_des: np.ndarray) -> np.ndarray:
         self.cbf_stats["calls"] += 1
         pos_i, _ = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=self.client_id)
@@ -1010,12 +1079,39 @@ class VlmCbfEnv:
                 neighbor_pos.append(np.array(pos_j[:2], dtype=np.float32))
                 neighbor_vel.append(self.last_safe_vel.get(other.base_id, np.zeros(2, dtype=np.float32)))
 
-        eta = 1.0
-        if self.cfg.use_ekf and self.object_belief is not None:
-            eta = 1.0 + self.cfg.cbf_kappa * self.object_belief.uncertainty()
-        v_max = self.cfg.speed_limit / max(eta, 1e-3)
-        d_min = self.cfg.separation_min * self.cfg.cbf_risk_scale
-        alpha_eff = self.cfg.cbf_alpha / max(eta, 1e-3)
+        belief_mu, belief_cov = self._belief_snapshot()
+        pos_unc = float(np.sqrt(max(0.0, np.trace(belief_cov[:2, :2]))))
+        yaw_unc = float(np.sqrt(max(0.0, belief_cov[2, 2])))
+
+        eta_speed = self._risk_factor(self.cfg.cbf_risk_s_speed, pos_unc)
+        eta_sep = self._risk_factor(self.cfg.cbf_risk_s_sep, pos_unc)
+        eta_force = self._risk_factor(self.cfg.cbf_risk_s_force, pos_unc + 0.5 * yaw_unc)
+        eta_neural = self._risk_factor(self.cfg.cbf_risk_s_neural, pos_unc + yaw_unc)
+
+        v_max = self.cfg.speed_limit / max(eta_speed, 1e-3)
+        d_min = self.cfg.separation_min * self.cfg.cbf_risk_scale * eta_sep
+        alpha_eff = self.cfg.cbf_alpha / max(eta_sep, 1e-3)
+        slack_weight = self.cfg.cbf_slack_weight * eta_sep
+        slack_max = self.cfg.cbf_slack_max / max(eta_sep, 1e-3)
+        contact_force = self._contact_force(robot)
+        contact_force_max_eff = self.cfg.contact_force_max / max(eta_force, 1e-3)
+
+        neural_h = 1.0
+        neural_input: Optional[np.ndarray] = None
+        if self.cfg.use_neural_cbf and self.neural_cbf is not None:
+            neural_eval = self.neural_cbf.eval_barrier(
+                force_n=contact_force / max(self.cfg.contact_force_max, 1e-6),
+                belief_mu=belief_mu,
+                belief_cov=belief_cov,
+            )
+            neural_h = float(neural_eval.h_value) / max(eta_neural, 1e-3)
+            neural_input = neural_eval.features
+            tighten = max(0.0, -neural_h) * self.cfg.neural_cbf_tighten_gain
+            d_min *= 1.0 + tighten
+            v_max *= max(0.12, 1.0 - tighten)
+            gate_arg = float(np.clip(self.cfg.neural_cbf_sigmoid_gain * neural_h, -20.0, 20.0))
+            gate = 1.0 / (1.0 + math.exp(-gate_arg))
+            v_max *= max(0.12, gate)
 
         result = solve_cbf_qp(
             v_des=v_des,
@@ -1025,8 +1121,8 @@ class VlmCbfEnv:
             v_max=v_max,
             d_min=d_min,
             alpha=alpha_eff,
-            slack_weight=self.cfg.cbf_slack_weight,
-            slack_max=self.cfg.cbf_slack_max,
+            slack_weight=slack_weight,
+            slack_max=slack_max,
         )
         v_safe = result.v_safe
 
@@ -1035,18 +1131,46 @@ class VlmCbfEnv:
             v_safe = np.zeros_like(v_safe)
             self.cbf_stats["fallback"] += 1
 
-        contact_force = self._contact_force(robot)
-        if contact_force > self.cfg.contact_force_max:
+        if contact_force > contact_force_max_eff:
             self.violations["force"] += 1
             v_safe = np.zeros_like(v_safe)
             self.cbf_stats["force_stop"] += 1
 
-        if np.linalg.norm(v_safe - v_des) > 1e-4:
+        intervention_l2 = float(np.linalg.norm(v_safe - v_des) ** 2)
+        if intervention_l2 > 1e-8:
             self.cbf_stats["modified"] += 1
 
+        sep_barriers = []
+        for pos_j in neighbor_pos:
+            delta = pos_i - pos_j
+            sep_barriers.append(float(np.dot(delta, delta) - d_min * d_min))
+        sep_barrier_min = min(sep_barriers) if sep_barriers else float(d_min * d_min)
+        speed_barrier = float(v_max * v_max - float(np.dot(v_safe, v_safe)))
+        force_barrier = float(contact_force_max_eff - contact_force)
+        sep_norm = sep_barrier_min / max(d_min * d_min, 1e-6)
+        speed_norm = speed_barrier / max(v_max * v_max, 1e-6)
+        force_norm = force_barrier / max(contact_force_max_eff, 1e-6)
+
+        self.cbf_step_metrics[robot.spec.name] = {
+            "intervention_l2": intervention_l2,
+            "sep_barrier_norm": float(sep_norm),
+            "speed_barrier_norm": float(speed_norm),
+            "force_barrier_norm": float(force_norm),
+            "neural_barrier": float(neural_h),
+            "sep_barrier_raw": float(sep_barrier_min),
+            "speed_barrier_raw": float(speed_barrier),
+            "force_barrier_raw": float(force_barrier),
+            "safe_vx": float(v_safe[0]),
+            "safe_vy": float(v_safe[1]),
+            "policy_vx": float(v_des[0]),
+            "policy_vy": float(v_des[1]),
+            "slack": float(result.slack),
+            "neural_input": neural_input.astype(np.float32).tolist() if neural_input is not None else None,
+        }
         return v_safe
 
     def _apply_actions(self, actions: Dict[int, RobotAction]) -> None:
+        self.cbf_step_metrics = {}
         for robot in self.robots:
             action = actions.get(robot.base_id, RobotAction((0.0, 0.0, 0.0)))
             vx, vy, yaw_rate = action.base_vel
@@ -1078,6 +1202,23 @@ class VlmCbfEnv:
                 self._maybe_detach(robot)
 
         self._apply_separation_safety()
+        if self.cbf_step_metrics:
+            metrics = list(self.cbf_step_metrics.values())
+            self.cbf_last_summary = {
+                "intervention_l2": float(sum(m["intervention_l2"] for m in metrics)),
+                "sep_barrier_norm_min": float(min(m["sep_barrier_norm"] for m in metrics)),
+                "speed_barrier_norm_min": float(min(m["speed_barrier_norm"] for m in metrics)),
+                "force_barrier_norm_min": float(min(m["force_barrier_norm"] for m in metrics)),
+                "neural_barrier_min": float(min(m["neural_barrier"] for m in metrics)),
+            }
+        else:
+            self.cbf_last_summary = {
+                "intervention_l2": 0.0,
+                "sep_barrier_norm_min": 1.0,
+                "speed_barrier_norm_min": 1.0,
+                "force_barrier_norm_min": 1.0,
+                "neural_barrier_min": 1.0,
+            }
 
     def _apply_base_motion(self, robot: RobotInstance, vx: float, vy: float, yaw_rate: float) -> None:
         pos, quat = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=self.client_id)
@@ -1304,8 +1445,9 @@ class VlmCbfEnv:
         self.phase_time += self.control_dt
         if self.cfg.use_ekf and self.object_belief is not None:
             self.object_belief.predict()
-            meas_pos, _ = self._get_object_pose(noisy=True)
-            self.object_belief.update((float(meas_pos[0]), float(meas_pos[1])))
+            meas_pos, meas_quat = self._get_object_pose(noisy=True)
+            meas_yaw = _yaw_from_quat(meas_quat)
+            self.object_belief.update((float(meas_pos[0]), float(meas_pos[1]), float(meas_yaw)))
         self._update_lift_target()
         self._maybe_fallback_carry_mode()
         self._carry_object_if_needed()

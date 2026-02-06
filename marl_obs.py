@@ -31,6 +31,14 @@ def _yaw_from_quat(quat) -> float:
     return p.getEulerFromQuaternion(quat)[2]
 
 
+def _wrap_angle(angle: float) -> float:
+    while angle > np.pi:
+        angle -= 2.0 * np.pi
+    while angle < -np.pi:
+        angle += 2.0 * np.pi
+    return float(angle)
+
+
 def build_observation(env: VlmCbfEnv) -> Tuple[np.ndarray, np.ndarray]:
     """
     Returns:
@@ -39,6 +47,7 @@ def build_observation(env: VlmCbfEnv) -> Tuple[np.ndarray, np.ndarray]:
     """
     obj_pos, obj_quat = env._get_object_pose(noisy=env.cfg.use_noisy_obs)
     obj_pos = np.array(obj_pos, dtype=np.float32)
+    obj_yaw = float(_yaw_from_quat(obj_quat))
     goal = np.array(env.goal_pos, dtype=np.float32)
     phase_vec = _phase_one_hot(env.phase.value)
 
@@ -68,7 +77,22 @@ def build_observation(env: VlmCbfEnv) -> Tuple[np.ndarray, np.ndarray]:
         grip = 1.0 if robot.grip_active else 0.0
         force = float(env._contact_force(robot)) if hasattr(env, "_contact_force") else 0.0
         force_norm = force / max(env.cfg.contact_force_max, 1e-3)
-        belief_unc = float(env.object_belief.uncertainty()) if env.object_belief is not None else 0.0
+        if env.object_belief is not None:
+            belief_mu = env.object_belief.mean().astype(np.float32)
+            belief_cov = env.object_belief.covariance().astype(np.float32)
+        else:
+            belief_mu = np.array([obj_pos[0], obj_pos[1], obj_yaw, 0.0, 0.0, 0.0], dtype=np.float32)
+            belief_cov = np.eye(6, dtype=np.float32) * 1e-3
+        belief_rel = np.array(
+            [
+                belief_mu[0] - pos_xy[0],
+                belief_mu[1] - pos_xy[1],
+                _wrap_angle(float(belief_mu[2] - yaw)),
+            ],
+            dtype=np.float32,
+        )
+        belief_vel = belief_mu[3:6]
+        belief_cov_diag = np.diag(belief_cov).astype(np.float32)[:6]
 
         obs = np.concatenate(
             [
@@ -80,7 +104,10 @@ def build_observation(env: VlmCbfEnv) -> Tuple[np.ndarray, np.ndarray]:
                 np.array([obj_pos[2], env.current_lift], dtype=np.float32),
                 phase_vec,
                 type_one_hot,
-                np.array([payload_norm, grip, force_norm, belief_unc], dtype=np.float32),
+                np.array([payload_norm, grip, force_norm], dtype=np.float32),
+                belief_rel,
+                belief_vel,
+                belief_cov_diag,
             ],
             axis=0,
         )
@@ -90,4 +117,4 @@ def build_observation(env: VlmCbfEnv) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def obs_dim() -> int:
-    return 2 + 1 + 2 + 2 + 2 + 2 + len(PHASES) + 2 + 4
+    return 2 + 1 + 2 + 2 + 2 + 2 + len(PHASES) + 2 + 3 + 3 + 3 + 6

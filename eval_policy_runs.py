@@ -28,6 +28,17 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-cbf", action="store_true", help="Disable CBF/QP safety filter")
     parser.add_argument("--no-neural-cbf", action="store_true", help="Disable neural force barrier in safety layer")
+    parser.add_argument(
+        "--no-probe-correct",
+        action="store_true",
+        help="Disable probe-and-correct phases (Contact -> Lift directly)",
+    )
+    parser.add_argument("--residual-model", default="", help="Path to learned residual correction model")
+    parser.add_argument(
+        "--no-learned-residual",
+        action="store_true",
+        help="Disable learned residual model and use heuristic correction",
+    )
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
     parser.add_argument("--out", default="eval_policy_results.csv", help="CSV output path")
 
@@ -131,6 +142,8 @@ def _run_episode(env: VlmCbfEnv, policy: GnnPolicy, device: torch.device, determ
     phase_times[prev_phase] += info["time"] - prev_time
     cbf_stats = info.get("cbf", {})
     grasp_stats = info.get("grasp", {})
+    probe = info.get("probe", {})
+    posterior = probe.get("posterior", [])
     return {
         "success": int(info["phase"] == "done"),
         "steps": steps,
@@ -151,6 +164,13 @@ def _run_episode(env: VlmCbfEnv, policy: GnnPolicy, device: torch.device, determ
             "detach_events": grasp_stats.get("detach_events", 0),
             "overload_drop": grasp_stats.get("overload_drop", 0),
             "stretch_drop": grasp_stats.get("stretch_drop", 0),
+        },
+        "probe": {
+            "force_target": probe.get("force_target", 0.0),
+            "force_measured": probe.get("force_measured", 0.0),
+            "ground_unloading": probe.get("ground_unloading", 0.0),
+            "posterior_max": max(posterior) if posterior else 0.0,
+            "residual_mode": probe.get("residual_mode", "none"),
         },
     }
 
@@ -193,6 +213,9 @@ def main() -> None:
         vacuum_force_margin=args.vacuum_force_margin,
         use_cbf=not args.no_cbf,
         use_neural_cbf=not args.no_neural_cbf,
+        residual_model_path=(args.residual_model if args.residual_model else None),
+        probe_use_learned_residual=not args.no_learned_residual,
+        enable_probe_correct=not args.no_probe_correct,
     )
     env = VlmCbfEnv(cfg)
     results = []
@@ -225,12 +248,18 @@ def main() -> None:
             "grasp_detach_events",
             "grasp_overload_drop",
             "grasp_stretch_drop",
+            "probe_force_target",
+            "probe_force_measured",
+            "probe_ground_unloading",
+            "probe_posterior_max",
+            "probe_residual_mode",
         ] + [f"time_{k}" for k in phase_keys]
         writer.writerow(header)
         for idx, res in enumerate(results):
             viol = res["violations"]
             cbf = res.get("cbf", {})
             grasp = res.get("grasp", {})
+            probe = res.get("probe", {})
             row = [
                 idx,
                 res["success"],
@@ -250,6 +279,11 @@ def main() -> None:
                 grasp.get("detach_events", 0),
                 grasp.get("overload_drop", 0),
                 grasp.get("stretch_drop", 0),
+                probe.get("force_target", 0.0),
+                probe.get("force_measured", 0.0),
+                probe.get("ground_unloading", 0.0),
+                probe.get("posterior_max", 0.0),
+                probe.get("residual_mode", "none"),
             ]
             row.extend([f"{res['phase_times'].get(k, 0.0):.3f}" for k in phase_keys])
             writer.writerow(row)

@@ -145,6 +145,17 @@ def _parse_args() -> argparse.Namespace:
         default=4.0,
         help="Coupling gain from approach velocity to normalized force in neural CBF model",
     )
+    parser.add_argument(
+        "--no-probe-correct",
+        action="store_true",
+        help="Disable probe-and-correct phases (Contact -> Lift directly)",
+    )
+    parser.add_argument("--residual-model", default="", help="Path to learned residual correction model")
+    parser.add_argument(
+        "--no-learned-residual",
+        action="store_true",
+        help="Disable learned residual model and use heuristic correction",
+    )
 
     parser.add_argument("--cbf-epsilon", type=float, default=0.2, help="Barrier shaping epsilon")
     parser.add_argument("--w-cbf-prox", type=float, default=0.2, help="Weight for CBF proximity penalty")
@@ -266,12 +277,25 @@ def _compute_reward(env: VlmCbfEnv, info: Dict, prev_viol: Dict[str, int], args:
         pos, _ = env._get_robot_pose(robot, noisy=False)
         robot_positions.append(np.array(pos, dtype=np.float32))
 
-    if env.phase in (Phase.PLAN, Phase.APPROACH):
+    if env.phase in (Phase.PLAN, Phase.APPROACH, Phase.FINE_APPROACH):
         waypoints = [r.waypoint if r.waypoint is not None else pos for r, pos in zip(env.robots, robot_positions)]
         reward -= _mean_distance(robot_positions, waypoints)
     elif env.phase == Phase.CONTACT:
         targets = [obj_pos for _ in robot_positions]
         reward -= _mean_distance(robot_positions, targets)
+    elif env.phase == Phase.PROBE:
+        probe = info.get("probe", {})
+        target_force = max(float(probe.get("force_target", 0.0)), 1e-6)
+        measured_force = float(probe.get("force_measured", 0.0))
+        unloading = float(probe.get("ground_unloading", 0.0))
+        posterior = probe.get("posterior", [])
+        max_post = float(max(posterior)) if posterior else 0.0
+        reward += 0.2 * min(1.0, measured_force / target_force)
+        reward += 0.15 * min(1.0, unloading / max(env.cfg.probe_ground_unloading_ratio, 1e-6))
+        reward += 0.1 * max_post
+    elif env.phase == Phase.CORRECT:
+        waypoints = [r.waypoint if r.waypoint is not None else pos for r, pos in zip(env.robots, robot_positions)]
+        reward -= 0.7 * _mean_distance(robot_positions, waypoints)
     elif env.phase == Phase.LIFT:
         reward += float(env.current_lift) * 2.0
     elif env.phase == Phase.TRANSPORT:
@@ -430,6 +454,9 @@ def main() -> None:
         neural_cbf_alpha=args.neural_cbf_alpha,
         neural_cbf_force_vel_gain=args.neural_cbf_force_vel_gain,
         cbf_eps=args.cbf_epsilon,
+        residual_model_path=(args.residual_model if args.residual_model else None),
+        probe_use_learned_residual=not args.no_learned_residual,
+        enable_probe_correct=not args.no_probe_correct,
     )
     env = VlmCbfEnv(cfg)
     env.reset()

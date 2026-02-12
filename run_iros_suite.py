@@ -68,6 +68,13 @@ def _parse_args() -> argparse.Namespace:
         help="Also evaluate learned policy with neural CBF disabled",
     )
     parser.add_argument("--run-vlm-eval", action="store_true", help="Also run VLM formation evaluation")
+    parser.add_argument("--run-probe-ablation", action="store_true", help="Also run probe/correct ablations")
+    parser.add_argument("--residual-model", default="", help="Path to learned residual corrector model")
+    parser.add_argument("--train-residual-model", action="store_true", help="Train residual corrector before train/eval")
+    parser.add_argument("--residual-samples", type=int, default=40000, help="Synthetic samples for residual trainer")
+    parser.add_argument("--residual-dataset-csv", default="", help="Optional residual dataset CSV for trainer")
+    parser.add_argument("--generate-residual-dataset", action="store_true", help="Generate residual dataset in simulation before training")
+    parser.add_argument("--residual-dataset-episodes", type=int, default=3000, help="Episodes for residual dataset generation")
     parser.add_argument("--vlm-model-id", default="llava-hf/llava-1.5-7b-hf", help="VLM model id for eval")
     parser.add_argument("--vlm-adapter", default="", help="LoRA adapter for VLM eval")
     parser.add_argument("--vlm-model-path", default="", help="Merged VLM model path alternative")
@@ -195,6 +202,8 @@ def main() -> None:
     train_csv = out_dir / "train_metrics.csv"
     eval_policy_csv = out_dir / "eval_learned_policy.csv"
     eval_policy_no_neural_csv = out_dir / "eval_learned_policy_no_neural.csv"
+    eval_policy_no_probe_csv = out_dir / "eval_learned_policy_no_probe.csv"
+    eval_policy_probe_heuristic_csv = out_dir / "eval_learned_policy_probe_heuristic.csv"
     eval_heuristic_cbf_csv = out_dir / "eval_heuristic_cbf.csv"
     eval_heuristic_no_cbf_csv = out_dir / "eval_heuristic_no_cbf.csv"
     vlm_eval_json = out_dir / "vlm_eval_metrics.json"
@@ -218,6 +227,38 @@ def main() -> None:
         "--vacuum-force-margin",
         str(args.vacuum_force_margin),
     ]
+    residual_model_path = Path(args.residual_model) if args.residual_model else (out_dir / "residual_corrector.joblib")
+    residual_dataset_path = Path(args.residual_dataset_csv) if args.residual_dataset_csv else (out_dir / "residual_dataset.csv")
+    if args.generate_residual_dataset:
+        residual_data_cmd = [
+            args.python,
+            "generate_residual_dataset.py",
+            "--out",
+            str(residual_dataset_path),
+            "--episodes",
+            str(args.residual_dataset_episodes),
+            "--seed",
+            str(args.seed if args.seed is not None else 13),
+        ]
+        if args.headless:
+            residual_data_cmd.append("--headless")
+        _run(residual_data_cmd, repo_dir)
+    if args.train_residual_model:
+        residual_cmd = [
+            args.python,
+            "train_residual_corrector.py",
+            "--out",
+            str(residual_model_path),
+            "--seed",
+            str(args.seed if args.seed is not None else 7),
+        ]
+        if residual_dataset_path.exists():
+            residual_cmd.extend(["--dataset-csv", str(residual_dataset_path)])
+        else:
+            residual_cmd.extend(["--samples", str(args.residual_samples)])
+        _run(residual_cmd, repo_dir)
+    if residual_model_path.exists():
+        shared_env_args.extend(["--residual-model", str(residual_model_path)])
     if args.seed is not None:
         shared_env_args.extend(["--seed", str(args.seed)])
     if args.headless:
@@ -294,6 +335,48 @@ def main() -> None:
     eval_policy_cmd.extend(shared_env_args)
     _run(eval_policy_cmd, repo_dir)
 
+    if args.run_probe_ablation:
+        eval_policy_no_probe_cmd = [
+            args.python,
+            "eval_policy_runs.py",
+            "--model",
+            str(policy_ckpt),
+            "--device",
+            args.device,
+            "--episodes",
+            str(args.episodes),
+            "--max-steps",
+            str(args.max_steps),
+            "--out",
+            str(eval_policy_no_probe_csv),
+            "--no-probe-correct",
+        ]
+        if args.deterministic_eval:
+            eval_policy_no_probe_cmd.append("--deterministic")
+        eval_policy_no_probe_cmd.extend(shared_env_args)
+        _run(eval_policy_no_probe_cmd, repo_dir)
+
+        if residual_model_path.exists():
+            eval_policy_probe_heuristic_cmd = [
+                args.python,
+                "eval_policy_runs.py",
+                "--model",
+                str(policy_ckpt),
+                "--device",
+                args.device,
+                "--episodes",
+                str(args.episodes),
+                "--max-steps",
+                str(args.max_steps),
+                "--out",
+                str(eval_policy_probe_heuristic_csv),
+                "--no-learned-residual",
+            ]
+            if args.deterministic_eval:
+                eval_policy_probe_heuristic_cmd.append("--deterministic")
+            eval_policy_probe_heuristic_cmd.extend(shared_env_args)
+            _run(eval_policy_probe_heuristic_cmd, repo_dir)
+
     if args.run_neural_ablation:
         eval_policy_no_neural_cmd = [
             args.python,
@@ -343,6 +426,10 @@ def main() -> None:
     _run(eval_heuristic_no_cbf_cmd, repo_dir)
 
     plot_paths = [eval_policy_csv, eval_heuristic_cbf_csv, eval_heuristic_no_cbf_csv]
+    if args.run_probe_ablation:
+        plot_paths.append(eval_policy_no_probe_csv)
+        if residual_model_path.exists():
+            plot_paths.append(eval_policy_probe_heuristic_csv)
     if args.run_neural_ablation:
         plot_paths.append(eval_policy_no_neural_csv)
     for csv_path in plot_paths:
@@ -381,6 +468,10 @@ def main() -> None:
         _run(vlm_cmd, repo_dir)
 
     summary_rows = [_summarize_csv(eval_policy_csv, "learned_policy")]
+    if args.run_probe_ablation:
+        summary_rows.append(_summarize_csv(eval_policy_no_probe_csv, "learned_policy_no_probe"))
+        if residual_model_path.exists():
+            summary_rows.append(_summarize_csv(eval_policy_probe_heuristic_csv, "learned_policy_probe_heuristic"))
     if args.run_neural_ablation:
         summary_rows.append(_summarize_csv(eval_policy_no_neural_csv, "learned_policy_no_neural"))
     summary_rows.extend(

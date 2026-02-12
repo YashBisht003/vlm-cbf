@@ -4,7 +4,7 @@ This project provides a PyBullet simulation environment that matches the
 VLM-CBF cooperative manipulation spec:
 - 4 mobile manipulators (2 heavy, 2 agile)
 - L/T/cuboid objects with randomized mass, COM, and friction
-- Phase-based coordination (Observe -> Plan -> Approach -> Contact -> Lift -> Transport -> Place)
+- Phase-based coordination (Observe -> Plan -> Approach -> FineApproach -> Contact -> Probe -> Correct -> Lift -> Transport -> Place)
 - Conflict-free task allocation (Hungarian)
 - Safety monitors (speed, separation, contact force)
 
@@ -165,6 +165,22 @@ GPU-focused run:
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --device cuda --updates 1600 --steps-per-update 512 --checkpoint-dir checkpoints --save-latest
 ```
 
+Train learned residual correction model (used in `Correct` phase):
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_residual_corrector.py --out residual_corrector.joblib --samples 40000
+```
+
+Generate residual dataset from simulation and train on it:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" generate_residual_dataset.py --out residual_dataset.csv --episodes 3000 --headless
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_residual_corrector.py --dataset-csv residual_dataset.csv --out residual_corrector.joblib
+```
+
+Use learned residual model during training/evaluation:
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --residual-model residual_corrector.joblib
+```
+
 Checkpoint behavior:
 - `mappo_policy_latest.pt` is saved every update (unless `--no-save-latest`).
 - `mappo_policy_update_XXXX.pt` is saved every `--save-every` updates.
@@ -200,6 +216,11 @@ Include learned-policy neural CBF ablation:
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train --run-neural-ablation
 ```
 
+Include probe/correct ablations (`no-probe`, `probe+heuristic`, `probe+learned`):
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train --generate-residual-dataset --train-residual-model --run-probe-ablation
+```
+
 Include VLM formation evaluation in suite:
 ```powershell
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train --run-vlm-eval --vlm-model-id llava-hf/llava-1.5-7b-hf --vlm-adapter llava_lora_out\adapter
@@ -210,6 +231,10 @@ The environment applies a CBF/QP safety filter per robot using OSQP.
 If the solver fails, the robot executes a monitored stop profile (`v <- v - k*dt*v`).
 The QP includes a slack variable for feasibility and clips final velocity to
 the ISO speed norm bound.
+Classical CBF constraints in the same QP include:
+- speed limit
+- robot-robot separation
+- contact-force barrier (`dB_force/dt + alpha*B_force >= 0`, belief-adaptive via EKF uncertainty)
 
 Neural force barrier integration (`h_phi([F_i, mu_b, Sigma_b])`):
 - The neural barrier is evaluated from force + EKF belief.
@@ -240,18 +265,35 @@ grasp can drop when:
 These events are logged in `info["grasp"]` for evaluation/debugging.
 
 ## VLM JSON Input (Optional)
-You can provide VLM formation output as JSON. The environment expects 4 waypoints
-in the object frame, plus load labels and an optional confidence score.
+You can provide VLM formation output as JSON. The environment accepts either:
+- single formation (`waypoints`, `load_labels`, `confidence`)
+- multi-hypothesis list (`hypotheses`), where each hypothesis includes
+  `waypoints`, `load_labels`, `confidence`, and optional `load_fractions`.
 
 Example:
 ```json
 {
-  "confidence": 0.82,
-  "waypoints": [
-    {"x": 0.45, "y": 0.00, "load": "high"},
-    {"x": -0.45, "y": 0.00, "load": "high"},
-    {"x": 0.00, "y": 0.30, "load": "low"},
-    {"x": 0.00, "y": -0.30, "load": "low"}
+  "hypotheses": [
+    {
+      "confidence": 0.56,
+      "load_fractions": [0.35, 0.35, 0.15, 0.15],
+      "waypoints": [
+        {"x": 0.45, "y": 0.00, "load": "high"},
+        {"x": -0.45, "y": 0.00, "load": "high"},
+        {"x": 0.00, "y": 0.30, "load": "low"},
+        {"x": 0.00, "y": -0.30, "load": "low"}
+      ]
+    },
+    {
+      "confidence": 0.27,
+      "load_fractions": [0.48, 0.22, 0.15, 0.15],
+      "waypoints": [
+        {"x": 0.52, "y": 0.00, "load": "high"},
+        {"x": -0.30, "y": 0.00, "load": "high"},
+        {"x": 0.00, "y": 0.30, "load": "low"},
+        {"x": 0.00, "y": -0.30, "load": "low"}
+      ]
+    }
   ]
 }
 ```
@@ -295,6 +337,8 @@ If you change these settings, regenerate the dataset before training.
 - `marl_obs.py`: observation builder for multi-agent policy training
 - `gnn_policy.py`: GNN policy and centralized critic definitions
 - `train_mappo.py`: MAPPO-style training script
+- `generate_residual_dataset.py`: creates probe/residual training rows from PyBullet scenes
+- `train_residual_corrector.py`: trains lightweight residual waypoint correction MLP
 - `train_vlm_llava_lora.py`: LLaVA LoRA fine-tuning script
 - `run_policy.py`: run a trained policy in the environment
 - `eval_runs.py`: batch evaluation and CSV logging
@@ -309,6 +353,8 @@ If you change these settings, regenerate the dataset before training.
 - CPU VLM (`train_vlm_cpu.py`) is a lightweight proxy, not a replacement for LLaVA fine-tuning.
 - If no VLM output is provided, the environment still falls back to geometric formation.
 - Reproduce VLM claims from this repo using `train_vlm_llava_lora.py` + `eval_vlm_formations.py` on a fixed split.
+- Multi-hypothesis probe-and-correct is implemented in simulation:
+  Bayesian hypothesis selection from early force ratios, then waypoint residual correction before lift.
 - The neural CBF currently uses a linearized inequality in QP with a local
   dynamics surrogate and autograd gradient; this is a practical implementation,
   not a full formal proof pipeline for forward invariance.

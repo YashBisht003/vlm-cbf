@@ -86,6 +86,17 @@ def _parse_args() -> argparse.Namespace:
         default="velocity",
         help="Base drive model (velocity is robust; wheel is full wheel dynamics)",
     )
+    parser.add_argument(
+        "--no-probe-correct",
+        action="store_true",
+        help="Disable probe-and-correct phases (Contact -> Lift directly)",
+    )
+    parser.add_argument("--residual-model", default="", help="Path to learned residual correction model")
+    parser.add_argument(
+        "--no-learned-residual",
+        action="store_true",
+        help="Disable learned residual model and use heuristic correction",
+    )
     parser.add_argument("--phase-approach-dist", type=float, default=0.25, help="Approach ready distance (m)")
     parser.add_argument(
         "--phase-approach-timeout-s",
@@ -283,6 +294,9 @@ def main() -> None:
         vacuum_break_dist=args.vacuum_break_dist,
         vacuum_force_margin=args.vacuum_force_margin,
         base_drive_mode=args.base_drive_mode,
+        residual_model_path=(args.residual_model if args.residual_model else None),
+        probe_use_learned_residual=not args.no_learned_residual,
+        enable_probe_correct=not args.no_probe_correct,
         phase_approach_dist=args.phase_approach_dist,
         phase_approach_timeout_s=args.phase_approach_timeout_s,
         phase_approach_min_ready=args.phase_approach_min_ready,

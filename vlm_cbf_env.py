@@ -29,13 +29,18 @@ from belief_ekf import BeliefEKF
 from cbf_qp import solve_cbf_qp
 from neural_cbf import NeuralCbfRuntime
 from p2p_udp import UdpPeerBus
+from residual_corrector import FEATURE_NAMES as RESIDUAL_FEATURE_NAMES
+from residual_corrector import ResidualCorrectorRuntime
 
 
 class Phase(Enum):
     OBSERVE = "observe"
     PLAN = "plan"
     APPROACH = "approach"
+    FINE_APPROACH = "fine_approach"
     CONTACT = "contact"
+    PROBE = "probe"
+    CORRECT = "correct"
     LIFT = "lift"
     TRANSPORT = "transport"
     PLACE = "place"
@@ -114,6 +119,7 @@ class TaskConfig:
     neural_cbf_sigmoid_gain: float = 0.0
     neural_cbf_alpha: float = 1.0
     neural_cbf_force_vel_gain: float = 4.0
+    force_cbf_vel_gain: float = 4.0
 
     use_udp_phase: bool = True
     use_udp_neighbor_state: bool = True
@@ -122,15 +128,33 @@ class TaskConfig:
     udp_state_ttl_s: float = 0.25
     phase_consensus_window_s: float = 0.10
     phase_approach_dist: float = 0.25
+    phase_fine_approach_dist: float = 0.10
+    phase_fine_approach_speed_limit: float = 0.075
     phase_approach_timeout_s: float = 20.0
     phase_approach_min_ready: int = 4
     phase_allow_quorum_fallback: bool = False
     phase_contact_force_threshold: float = 5.0
+    phase_correct_settle_dist: float = 0.08
+    phase_correct_settle_s: float = 0.25
     phase_lift_stability_s: float = 1.0
     phase_lift_vertical_speed_max: float = 0.05
 
     vlm_json_path: Optional[str] = None
     vlm_confidence_threshold: float = 0.5
+    vlm_hypothesis_count: int = 3
+    vlm_min_posterior: float = 0.4
+
+    probe_duration_min_s: float = 1.0
+    probe_duration_max_s: float = 2.5
+    probe_ramp_s: float = 0.8
+    probe_ground_unloading_ratio: float = 0.30
+    probe_force_sigma: float = 0.15
+    probe_residual_gain: float = 0.12
+    probe_residual_max: float = 0.12
+    probe_weak_robot_force_frac: float = 0.30
+    residual_model_path: Optional[str] = None
+    probe_use_learned_residual: bool = True
+    enable_probe_correct: bool = True
 
     heavy_urdf: Optional[str] = None
     agile_urdf: Optional[str] = None
@@ -194,6 +218,14 @@ class ObjectSpec:
     mass: float
     friction: float
     com_offset: Tuple[float, float, float]
+
+
+@dataclass
+class FormationHypothesis:
+    waypoints_local: List[Tuple[float, float]]
+    load_labels: List[str]
+    confidence: float
+    load_fractions: np.ndarray
 
 
 @dataclass
@@ -288,12 +320,25 @@ class VlmCbfEnv:
         self.object_belief: Optional[BeliefEKF] = None
         if not hasattr(self, "neural_cbf"):
             self.neural_cbf: Optional[NeuralCbfRuntime] = None
+        if not hasattr(self, "residual_corrector"):
+            self.residual_corrector: Optional[ResidualCorrectorRuntime] = None
         self.object_start_height: float = 0.0
         self._lift_stable_since: Optional[float] = None
         self.udp_bus: Optional[UdpPeerBus] = None
         self.peer_packets: Dict[str, dict] = {}
         self.phase_sync_delays_ms: List[float] = []
         self.phase_sync_last_delay_ms: float = 0.0
+        self.vlm_hypotheses: List[FormationHypothesis] = []
+        self.vlm_hypothesis_assignments: List[List[np.ndarray]] = []
+        self.vlm_selected_idx: int = 0
+        self.vlm_posterior: List[float] = []
+        self.probe_started_at: Optional[float] = None
+        self.probe_force_target: float = 0.0
+        self.probe_force_measured: float = 0.0
+        self.probe_load_fraction_measured: List[float] = [0.25, 0.25, 0.25, 0.25]
+        self.probe_ground_unloading: float = 0.0
+        self.correct_started_at: Optional[float] = None
+        self.probe_residual_mode: str = "heuristic"
 
     def reset(self) -> Dict:
         p.resetSimulation(physicsClientId=self.client_id)
@@ -331,6 +376,11 @@ class VlmCbfEnv:
                     model_path=None,
                     device=self.cfg.neural_cbf_device,
                 )
+        if self.cfg.probe_use_learned_residual and self.cfg.residual_model_path and self.residual_corrector is None:
+            try:
+                self.residual_corrector = ResidualCorrectorRuntime(self.cfg.residual_model_path)
+            except FileNotFoundError:
+                self.residual_corrector = None
         obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
         self.object_start_height = float(obj_pos[2])
         if self.cfg.use_udp_phase or self.cfg.use_udp_neighbor_state:
@@ -356,6 +406,7 @@ class VlmCbfEnv:
             actions = self._simple_policy()
         self._apply_actions(actions)
         self._step_physics()
+        self._update_probe_state()
         local_ready = self._phase_local_ready_map()
         self._udp_broadcast_local_state(local_ready)
         self._udp_poll()
@@ -389,6 +440,16 @@ class VlmCbfEnv:
                 "last_delay_ms": float(self.phase_sync_last_delay_ms),
                 "mean_delay_ms": phase_sync_mean,
                 "events": len(self.phase_sync_delays_ms),
+            },
+            "probe": {
+                "started_at": None if self.probe_started_at is None else float(self.probe_started_at),
+                "force_target": float(self.probe_force_target),
+                "force_measured": float(self.probe_force_measured),
+                "load_fraction_measured": [float(v) for v in self.probe_load_fraction_measured],
+                "ground_unloading": float(self.probe_ground_unloading),
+                "posterior": [float(v) for v in self.vlm_posterior],
+                "selected_idx": int(self.vlm_selected_idx),
+                "residual_mode": str(self.probe_residual_mode),
             },
         }
         return obs, info
@@ -862,10 +923,13 @@ class VlmCbfEnv:
 
             target = None
             grip = False
-            if self.phase in (Phase.APPROACH, Phase.PLAN):
+            if self.phase in (Phase.APPROACH, Phase.FINE_APPROACH, Phase.PLAN):
                 target = robot.waypoint
-            elif self.phase == Phase.CONTACT:
+            elif self.phase in (Phase.CONTACT, Phase.PROBE):
                 target = self._object_contact_target(base_pos)
+                grip = True
+            elif self.phase == Phase.CORRECT:
+                target = robot.waypoint if robot.waypoint is not None else base_pos
                 grip = True
             elif self.phase == Phase.LIFT:
                 target = base_pos
@@ -899,7 +963,7 @@ class VlmCbfEnv:
         if target is None:
             return (0.0, 0.0, 0.0)
         delta = target[:2] - base_pos[:2]
-        if self.phase == Phase.APPROACH and self.object_id is not None and self.object_spec is not None:
+        if self.phase in (Phase.APPROACH, Phase.FINE_APPROACH) and self.object_id is not None and self.object_spec is not None:
             obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
             obj_xy = np.array(obj_pos[:2], dtype=np.float32)
             to_obj = base_pos[:2] - obj_xy
@@ -919,7 +983,10 @@ class VlmCbfEnv:
         if dist < 1e-3:
             return (0.0, 0.0, 0.0)
         vel_dir = delta / dist
-        speed = min(self.cfg.speed_limit, dist * 0.8)
+        speed_limit = self.cfg.speed_limit
+        if self.phase == Phase.FINE_APPROACH:
+            speed_limit = min(speed_limit, self.cfg.phase_fine_approach_speed_limit)
+        speed = min(speed_limit, dist * 0.8)
         vx, vy = vel_dir[0] * speed, vel_dir[1] * speed
         return (vx, vy, 0.0)
 
@@ -965,10 +1032,31 @@ class VlmCbfEnv:
             pos, _ = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=self.client_id)
             return np.linalg.norm(np.array(pos)[:2] - robot.waypoint[:2]) < self.cfg.phase_approach_dist
 
+        if self.phase == Phase.FINE_APPROACH:
+            if robot.waypoint is None:
+                return False
+            pos, _ = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=self.client_id)
+            return np.linalg.norm(np.array(pos)[:2] - robot.waypoint[:2]) < self.cfg.phase_fine_approach_dist
+
         if self.phase == Phase.CONTACT:
             if robot.constraint_id is not None:
                 return True
             return self._contact_force(robot) >= self.cfg.phase_contact_force_threshold
+
+        if self.phase == Phase.PROBE:
+            return self._probe_done()
+
+        if self.phase == Phase.CORRECT:
+            if robot.waypoint is None:
+                return False
+            pos, _ = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=self.client_id)
+            settled = np.linalg.norm(np.array(pos)[:2] - robot.waypoint[:2]) < self.cfg.phase_correct_settle_dist
+            if not settled:
+                self.correct_started_at = None
+                return False
+            if self.correct_started_at is None:
+                self.correct_started_at = self.sim_time
+            return (self.sim_time - self.correct_started_at) >= self.cfg.phase_correct_settle_s
 
         if self.phase == Phase.LIFT:
             obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
@@ -994,7 +1082,7 @@ class VlmCbfEnv:
         return False
 
     def _phase_ready_count(self) -> int:
-        if self.phase not in (Phase.APPROACH, Phase.CONTACT, Phase.LIFT, Phase.TRANSPORT):
+        if self.phase not in (Phase.APPROACH, Phase.FINE_APPROACH, Phase.CONTACT, Phase.PROBE, Phase.CORRECT, Phase.LIFT, Phase.TRANSPORT):
             return 0
         count = 0
         for robot in self.robots:
@@ -1027,7 +1115,7 @@ class VlmCbfEnv:
         Returns:
             (consensus_reached, sync_delay_seconds)
         """
-        if self.phase not in (Phase.APPROACH, Phase.CONTACT, Phase.LIFT, Phase.TRANSPORT):
+        if self.phase not in (Phase.APPROACH, Phase.FINE_APPROACH, Phase.CONTACT, Phase.PROBE, Phase.CORRECT, Phase.LIFT, Phase.TRANSPORT):
             return False, 0.0
         names = [robot.spec.name for robot in self.robots]
         ready_times: List[float] = []
@@ -1046,6 +1134,155 @@ class VlmCbfEnv:
         if delay > self.cfg.phase_consensus_window_s:
             return False, delay
         return True, delay
+
+    def _update_probe_state(self) -> None:
+        if self.object_spec is None:
+            return
+        if self.phase != Phase.PROBE:
+            self.probe_started_at = None
+            self.probe_force_measured = 0.0
+            self.probe_ground_unloading = 0.0
+            return
+        if self.probe_started_at is None:
+            self.probe_started_at = self.sim_time
+            self.correct_started_at = None
+        forces = np.asarray([max(0.0, self._contact_force(robot)) for robot in self.robots], dtype=np.float32)
+        total_force = float(np.sum(forces))
+        self.probe_force_measured = total_force
+        denom = max(total_force, 1e-6)
+        self.probe_load_fraction_measured = (forces / denom).astype(np.float32).tolist()
+
+        weight = max(1e-6, float(self.object_spec.mass) * 9.81)
+        self.probe_ground_unloading = float(np.clip(total_force / weight, 0.0, 2.0))
+
+        weakest_force_cap = min(float(robot.spec.payload) * 9.81 for robot in self.robots)
+        team_probe = 0.15 * weight
+        capped = float(self.cfg.probe_weak_robot_force_frac) * weakest_force_cap * len(self.robots)
+        self.probe_force_target = min(team_probe, capped)
+
+    def _probe_done(self) -> bool:
+        if self.phase != Phase.PROBE:
+            return False
+        if self.probe_started_at is None:
+            return False
+        elapsed = self.sim_time - self.probe_started_at
+        if elapsed < self.cfg.probe_duration_min_s:
+            return False
+        if elapsed >= self.cfg.probe_duration_max_s:
+            return True
+        target = max(self.probe_force_target, 1e-6)
+        reached_target = self.probe_force_measured >= 0.8 * target
+        unloading = self.probe_ground_unloading >= self.cfg.probe_ground_unloading_ratio
+        return bool(reached_target and unloading)
+
+    def _select_probe_hypothesis(self) -> None:
+        if not self.vlm_hypotheses:
+            return
+        measured = np.asarray(self.probe_load_fraction_measured, dtype=np.float32)
+        measured = np.clip(measured, 1e-6, None)
+        measured = measured / float(np.sum(measured))
+
+        prior = np.asarray([max(1e-6, h.confidence) for h in self.vlm_hypotheses], dtype=np.float32)
+        prior = prior / float(np.sum(prior))
+        sigma = max(1e-3, float(self.cfg.probe_force_sigma))
+        likelihood = np.zeros_like(prior)
+
+        for idx, hyp in enumerate(self.vlm_hypotheses):
+            pred = np.asarray(hyp.load_fractions, dtype=np.float32)
+            pred = np.clip(pred, 1e-6, None)
+            pred = pred / float(np.sum(pred))
+            err = measured - pred
+            mahal = float(np.sum((err / sigma) ** 2))
+            likelihood[idx] = float(np.exp(-0.5 * mahal))
+
+        posterior = prior * np.clip(likelihood, 1e-12, None)
+        posterior = posterior / float(np.sum(posterior))
+        self.vlm_posterior = posterior.astype(np.float32).tolist()
+        selected = int(np.argmax(posterior))
+        if float(np.max(posterior)) < self.cfg.vlm_min_posterior:
+            selected = 0
+        self.vlm_selected_idx = selected
+
+    def _apply_residual_correction(self) -> None:
+        if not self.vlm_hypothesis_assignments:
+            return
+        idx = int(np.clip(self.vlm_selected_idx, 0, len(self.vlm_hypothesis_assignments) - 1))
+        base_assignment = self.vlm_hypothesis_assignments[idx]
+        target_frac = np.asarray(self.vlm_hypotheses[idx].load_fractions, dtype=np.float32)
+        target_frac = target_frac / float(np.sum(target_frac))
+        measured = np.asarray(self.probe_load_fraction_measured, dtype=np.float32)
+        measured = np.clip(measured, 1e-6, None)
+        measured = measured / float(np.sum(measured))
+
+        if self.object_id is None:
+            return
+        obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
+        obj_center = np.array(obj_pos, dtype=np.float32)
+        gain = float(self.cfg.probe_residual_gain)
+        max_shift = float(self.cfg.probe_residual_max)
+        posterior_max = float(max(self.vlm_posterior)) if self.vlm_posterior else 0.0
+        selected_conf = float(self.vlm_hypotheses[idx].confidence) if idx < len(self.vlm_hypotheses) else 0.0
+        belief_mu, belief_cov = self._belief_snapshot()
+        belief_unc_pos = float(np.sqrt(max(0.0, np.trace(belief_cov[:2, :2]))))
+        dims = self.object_spec.dims if self.object_spec is not None else (1.0, 1.0, 1.0)
+        mass = float(self.object_spec.mass) if self.object_spec is not None else 50.0
+        self.probe_residual_mode = "heuristic"
+
+        for idx_robot, robot in enumerate(self.robots):
+            wp = np.array(base_assignment[idx_robot], dtype=np.float32)
+            radial = wp[:2] - obj_center[:2]
+            norm = float(np.linalg.norm(radial))
+            if norm < 1e-6:
+                radial = np.array([1.0, 0.0], dtype=np.float32)
+                norm = 1.0
+            dir_xy = radial / norm
+            delta_share = float(measured[idx_robot] - target_frac[idx_robot])
+            if (
+                self.cfg.probe_use_learned_residual
+                and self.residual_corrector is not None
+            ):
+                feature = np.array(
+                    [
+                        float(measured[idx_robot]),
+                        float(target_frac[idx_robot]),
+                        float(delta_share),
+                        posterior_max,
+                        selected_conf,
+                        float(robot.spec.payload / 150.0),
+                        1.0 if robot.spec.payload >= 100.0 else 0.0,
+                        float(mass / 280.0),
+                        float(dims[0] / 2.0),
+                        float(dims[1] / 2.0),
+                        float(dims[2] / 1.0),
+                        belief_unc_pos,
+                        float(dir_xy[0]),
+                        float(dir_xy[1]),
+                    ],
+                    dtype=np.float32,
+                )
+                if feature.shape[0] == len(RESIDUAL_FEATURE_NAMES):
+                    try:
+                        pred = self.residual_corrector.predict(feature)
+                        corr_xy = np.array(
+                            [
+                                float(np.clip(pred.dx, -max_shift, max_shift)),
+                                float(np.clip(pred.dy, -max_shift, max_shift)),
+                            ],
+                            dtype=np.float32,
+                        )
+                        wp[:2] = wp[:2] + corr_xy
+                        self.probe_residual_mode = "learned"
+                    except Exception:
+                        shift = np.clip(gain * delta_share, -max_shift, max_shift)
+                        wp[:2] = wp[:2] + shift * dir_xy
+                else:
+                    shift = np.clip(gain * delta_share, -max_shift, max_shift)
+                    wp[:2] = wp[:2] + shift * dir_xy
+            else:
+                shift = np.clip(gain * delta_share, -max_shift, max_shift)
+                wp[:2] = wp[:2] + shift * dir_xy
+            robot.waypoint = wp
+            robot.waypoint_offset = wp - obj_center
 
     def _belief_snapshot(self) -> Tuple[np.ndarray, np.ndarray]:
         if self.cfg.use_ekf and self.object_belief is not None:
@@ -1102,6 +1339,8 @@ class VlmCbfEnv:
         eta_neural = self._risk_factor(self.cfg.cbf_risk_s_neural, pos_unc + yaw_unc)
 
         v_max = self.cfg.speed_limit / max(eta_speed, 1e-3)
+        if self.phase in (Phase.FINE_APPROACH, Phase.CONTACT, Phase.PROBE):
+            v_max = min(v_max, self.cfg.phase_fine_approach_speed_limit)
         d_min = self.cfg.separation_min * self.cfg.cbf_risk_scale * eta_sep
         alpha_eff = self.cfg.cbf_alpha / max(eta_sep, 1e-3)
         slack_weight = self.cfg.cbf_slack_weight * eta_sep
@@ -1109,24 +1348,42 @@ class VlmCbfEnv:
         contact_force = self._contact_force(robot)
         contact_force_max_eff = self.cfg.contact_force_max / max(eta_force, 1e-3)
 
+        obj_pos_world, _ = self._get_object_pose(noisy=False)
+        obj_xy = np.array(obj_pos_world[:2], dtype=np.float32)
+        rel = obj_xy - pos_i
+        rel_norm = float(np.linalg.norm(rel))
+        if rel_norm > 1e-6:
+            normal_xy = rel / rel_norm
+        else:
+            normal_xy = np.zeros(2, dtype=np.float32)
+        obj_vel_xy = np.asarray(belief_mu[3:5], dtype=np.float32)
+
+        force_norm_scale = max(self.cfg.contact_force_max, 1e-6)
+        force_n0 = contact_force / force_norm_scale
+        force_limit_n = contact_force_max_eff / force_norm_scale
+        force_gain_dt = max(0.0, float(self.cfg.force_cbf_vel_gain)) * self.control_dt
+        force_barrier_ref = float(force_limit_n - force_n0)
+        force_barrier_safe = force_barrier_ref
+
         neural_h = 1.0
         neural_h_ref = 1.0
         neural_h_safe = 1.0
         neural_input: Optional[np.ndarray] = None
         neural_constraint_margin = 1.0
         extra_linear: List[Tuple[np.ndarray, float]] = []
-        if self.cfg.use_neural_cbf and self.neural_cbf is not None:
-            force_n0 = contact_force / max(self.cfg.contact_force_max, 1e-6)
-            obj_pos_world, _ = self._get_object_pose(noisy=False)
-            obj_xy = np.array(obj_pos_world[:2], dtype=np.float32)
-            rel = obj_xy - pos_i
-            rel_norm = float(np.linalg.norm(rel))
-            if rel_norm > 1e-6:
-                normal_xy = rel / rel_norm
-            else:
-                normal_xy = np.zeros(2, dtype=np.float32)
-            obj_vel_xy = np.asarray(belief_mu[3:5], dtype=np.float32)
 
+        # Classical force CBF in the QP:
+        # B_force = F_limit - F_pred, with dB/dt + alpha*B >= 0 linearized in base velocity.
+        if rel_norm > 1e-6 and force_gain_dt > 1e-7:
+            alpha_force = self.cfg.cbf_alpha / max(eta_force, 1e-3)
+            coeff_force = -force_gain_dt * normal_xy
+            rhs_force = float(
+                -force_gain_dt * float(np.dot(normal_xy, obj_vel_xy))
+                - alpha_force * force_barrier_ref
+            )
+            extra_linear.append((coeff_force.astype(np.float32), rhs_force))
+
+        if self.cfg.use_neural_cbf and self.neural_cbf is not None:
             v_ref = np.asarray(v_des, dtype=np.float32).reshape(2)
             neural_lin = self.neural_cbf.linearized_velocity_constraint(
                 force_n=force_n0,
@@ -1170,19 +1427,18 @@ class VlmCbfEnv:
         )
         v_safe = result.v_safe
 
+        if rel_norm > 1e-6 and force_gain_dt > 1e-7:
+            approach_speed_safe_force = float(
+                np.dot(np.asarray(v_safe, dtype=np.float32) - obj_vel_xy, normal_xy)
+            )
+            force_pred_safe = float(np.clip(force_n0 + force_gain_dt * approach_speed_safe_force, 0.0, 3.0))
+            force_barrier_safe = float(force_limit_n - force_pred_safe)
+
         if self.cfg.use_neural_cbf and self.neural_cbf is not None:
-            obj_pos_world, _ = self._get_object_pose(noisy=False)
-            obj_xy = np.array(obj_pos_world[:2], dtype=np.float32)
-            rel = obj_xy - pos_i
-            rel_norm = float(np.linalg.norm(rel))
-            if rel_norm > 1e-6:
-                normal_xy = rel / rel_norm
-            else:
-                normal_xy = np.zeros(2, dtype=np.float32)
             approach_speed_safe = float(np.dot(np.asarray(v_safe, dtype=np.float32) - obj_vel_xy, normal_xy))
             force_safe_n = float(
                 np.clip(
-                    (contact_force / max(self.cfg.contact_force_max, 1e-6))
+                    force_n0
                     + self.cfg.neural_cbf_force_vel_gain * self.control_dt * approach_speed_safe,
                     0.0,
                     2.5,
@@ -1219,10 +1475,10 @@ class VlmCbfEnv:
             sep_barriers.append(float(np.dot(delta, delta) - d_min * d_min))
         sep_barrier_min = min(sep_barriers) if sep_barriers else float(d_min * d_min)
         speed_barrier = float(v_max * v_max - float(np.dot(v_safe, v_safe)))
-        force_barrier = float(contact_force_max_eff - contact_force)
+        force_barrier = float(force_barrier_safe)
         sep_norm = sep_barrier_min / max(d_min * d_min, 1e-6)
         speed_norm = speed_barrier / max(v_max * v_max, 1e-6)
-        force_norm = force_barrier / max(contact_force_max_eff, 1e-6)
+        force_norm = force_barrier / max(force_limit_n, 1e-6)
 
         self.cbf_step_metrics[robot.spec.name] = {
             "intervention_l2": intervention_l2,
@@ -1236,6 +1492,7 @@ class VlmCbfEnv:
             "sep_barrier_raw": float(sep_barrier_min),
             "speed_barrier_raw": float(speed_barrier),
             "force_barrier_raw": float(force_barrier),
+            "force_barrier_ref_raw": float(force_barrier_ref),
             "safe_vx": float(v_safe[0]),
             "safe_vy": float(v_safe[1]),
             "policy_vx": float(v_des[0]),
@@ -1266,7 +1523,7 @@ class VlmCbfEnv:
             self.last_safe_vel[robot.base_id] = np.array([vx, vy], dtype=np.float32)
 
             if self.cfg.use_ik and robot.end_effector_link >= 0:
-                if self.phase in (Phase.CONTACT, Phase.LIFT, Phase.TRANSPORT, Phase.PLACE):
+                if self.phase in (Phase.CONTACT, Phase.PROBE, Phase.CORRECT, Phase.LIFT, Phase.TRANSPORT, Phase.PLACE):
                     self._apply_ik(robot)
                 else:
                     self._hold_arm_home(robot)
@@ -1642,7 +1899,7 @@ class VlmCbfEnv:
         if self.phase == Phase.APPROACH:
             local_ready = self._phase_local_ready_map()
             if all(v == 1 for v in local_ready.values()):
-                self.phase = Phase.CONTACT
+                self.phase = Phase.FINE_APPROACH
                 self.phase_time = 0.0
                 return
             if (
@@ -1650,11 +1907,33 @@ class VlmCbfEnv:
                 and self.phase_time >= self.cfg.phase_approach_timeout_s
                 and sum(local_ready.values()) >= self.cfg.phase_approach_min_ready
             ):
+                self.phase = Phase.FINE_APPROACH
+                self.phase_time = 0.0
+                return
+
+        if self.phase == Phase.FINE_APPROACH:
+            local_ready = self._phase_local_ready_map()
+            if all(v == 1 for v in local_ready.values()):
                 self.phase = Phase.CONTACT
                 self.phase_time = 0.0
                 return
 
         if self.phase == Phase.CONTACT and self._all_gripping():
+            self.phase = Phase.PROBE if self.cfg.enable_probe_correct else Phase.LIFT
+            self.phase_time = 0.0
+            self.probe_started_at = None
+            return
+
+        if self.phase == Phase.PROBE and self._probe_done():
+            self._select_probe_hypothesis()
+            self._set_active_hypothesis(self.vlm_selected_idx)
+            self._apply_residual_correction()
+            self.phase = Phase.CORRECT
+            self.phase_time = 0.0
+            self.correct_started_at = None
+            return
+
+        if self.phase == Phase.CORRECT and all(v == 1 for v in self._phase_local_ready_map().values()):
             self.phase = Phase.LIFT
             self.phase_time = 0.0
             return
@@ -1699,7 +1978,7 @@ class VlmCbfEnv:
             ):
                 self.phase_sync_last_delay_ms = float(self.cfg.phase_consensus_window_s * 1000.0)
                 self.phase_sync_delays_ms.append(self.phase_sync_last_delay_ms)
-                self.phase = Phase.CONTACT
+                self.phase = Phase.FINE_APPROACH
                 self.phase_time = 0.0
             return
 
@@ -1707,11 +1986,31 @@ class VlmCbfEnv:
         self.phase_sync_delays_ms.append(self.phase_sync_last_delay_ms)
 
         if self.phase == Phase.APPROACH:
+            self.phase = Phase.FINE_APPROACH
+            self.phase_time = 0.0
+            return
+
+        if self.phase == Phase.FINE_APPROACH:
             self.phase = Phase.CONTACT
             self.phase_time = 0.0
             return
 
         if self.phase == Phase.CONTACT:
+            self.phase = Phase.PROBE if self.cfg.enable_probe_correct else Phase.LIFT
+            self.phase_time = 0.0
+            self.probe_started_at = None
+            return
+
+        if self.phase == Phase.PROBE:
+            self._select_probe_hypothesis()
+            self._set_active_hypothesis(self.vlm_selected_idx)
+            self._apply_residual_correction()
+            self.phase = Phase.CORRECT
+            self.phase_time = 0.0
+            self.correct_started_at = None
+            return
+
+        if self.phase == Phase.CORRECT:
             self.phase = Phase.LIFT
             self.phase_time = 0.0
             return
@@ -1735,19 +2034,37 @@ class VlmCbfEnv:
         else:
             obj_pos, obj_quat = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
         dims = self.object_spec.dims
-        vlm_out = self._vlm_json_formation()
-        if vlm_out is None:
-            waypoints, load_labels = self._geometric_fallback(dims)
-        else:
-            waypoints, load_labels, conf = vlm_out
-            if conf < self.cfg.vlm_confidence_threshold:
-                waypoints, load_labels = self._geometric_fallback(dims)
-        world_waypoints = self._to_world_waypoints(obj_pos, obj_quat, waypoints)
-        assignment = self._assign_robots(world_waypoints, load_labels)
-        obj_center = np.array(obj_pos)
-        for robot, waypoint in zip(self.robots, assignment):
-            robot.waypoint = np.array(waypoint)
-            robot.waypoint_offset = np.array(waypoint) - obj_center
+        hypotheses = self._vlm_json_hypotheses()
+        if not hypotheses:
+            hypotheses = self._default_hypotheses(dims)
+
+        hypotheses = sorted(hypotheses, key=lambda h: float(h.confidence), reverse=True)
+        hypotheses = hypotheses[: max(1, int(self.cfg.vlm_hypothesis_count))]
+        self.vlm_hypotheses = hypotheses
+        self.vlm_hypothesis_assignments = []
+        obj_center = np.array(obj_pos, dtype=np.float32)
+
+        for hyp in self.vlm_hypotheses:
+            if hyp.confidence < self.cfg.vlm_confidence_threshold:
+                pts, labels = self._geometric_fallback(dims)
+                local_hyp = self._build_hypothesis(pts, labels, hyp.confidence)
+            else:
+                local_hyp = hyp
+            world_waypoints = self._to_world_waypoints(obj_pos, obj_quat, local_hyp.waypoints_local)
+            assignment = self._assign_robots(world_waypoints, local_hyp.load_labels)
+            self.vlm_hypothesis_assignments.append([np.array(wp, dtype=np.float32) for wp in assignment])
+
+        if not self.vlm_hypothesis_assignments:
+            pts, labels = self._geometric_fallback(dims)
+            fallback_h = self._build_hypothesis(pts, labels, confidence=1.0)
+            self.vlm_hypotheses = [fallback_h]
+            world_waypoints = self._to_world_waypoints(obj_pos, obj_quat, fallback_h.waypoints_local)
+            self.vlm_hypothesis_assignments = [[np.array(wp, dtype=np.float32) for wp in self._assign_robots(world_waypoints, fallback_h.load_labels)]]
+
+        conf = np.array([max(1e-6, float(h.confidence)) for h in self.vlm_hypotheses], dtype=np.float32)
+        self.vlm_posterior = (conf / float(np.sum(conf))).astype(np.float32).tolist()
+        self.vlm_selected_idx = int(np.argmax(conf))
+        self._set_active_hypothesis(self.vlm_selected_idx, obj_center=obj_center)
 
     def _plan_goal_formation(self) -> None:
         if self.object_spec is None:
@@ -1844,6 +2161,97 @@ class VlmCbfEnv:
         points = points[:4]
         labels = (labels + ["low"] * 4)[:4]
         return points, labels, confidence
+
+    def _build_hypothesis(
+        self,
+        points: List[Tuple[float, float]],
+        labels: List[str],
+        confidence: float,
+        load_fractions: Optional[List[float]] = None,
+    ) -> FormationHypothesis:
+        pts = [(float(p[0]), float(p[1])) for p in points[:4]]
+        lbs = [self._normalize_load_label(v) for v in labels[:4]]
+        while len(pts) < 4:
+            pts.append((0.0, 0.0))
+        while len(lbs) < 4:
+            lbs.append("low")
+        if load_fractions is not None and len(load_fractions) >= 4:
+            frac = np.asarray(load_fractions[:4], dtype=np.float32)
+            frac = np.clip(frac, 1e-6, None)
+            frac = frac / float(np.sum(frac))
+        else:
+            raw = np.asarray([2.0 if l == "high" else 1.0 for l in lbs], dtype=np.float32)
+            frac = raw / float(np.sum(raw))
+        return FormationHypothesis(
+            waypoints_local=pts,
+            load_labels=lbs,
+            confidence=float(max(1e-6, confidence)),
+            load_fractions=frac.astype(np.float32),
+        )
+
+    def _default_hypotheses(self, dims: Tuple[float, float, float]) -> List[FormationHypothesis]:
+        length, width, _ = dims
+        base_pts, base_labels = self._geometric_fallback(dims)
+
+        front_pts = [
+            (length * 0.38, 0.0),
+            (-length * 0.26, 0.0),
+            (0.0, width * 0.30),
+            (0.0, -width * 0.30),
+        ]
+        asym_pts = [
+            (length * 0.34, width * 0.10),
+            (-length * 0.24, -width * 0.08),
+            (0.06 * length, width * 0.34),
+            (-0.04 * length, -width * 0.24),
+        ]
+
+        return [
+            self._build_hypothesis(base_pts, base_labels, 0.55, [0.35, 0.35, 0.15, 0.15]),
+            self._build_hypothesis(front_pts, base_labels, 0.28, [0.48, 0.22, 0.15, 0.15]),
+            self._build_hypothesis(asym_pts, base_labels, 0.17, [0.40, 0.20, 0.30, 0.10]),
+        ]
+
+    def _vlm_json_hypotheses(self) -> List[FormationHypothesis]:
+        data = self._load_vlm_json()
+        if data is None:
+            return []
+        root = data.get("formation", data) if isinstance(data, dict) else data
+
+        hypotheses: List[FormationHypothesis] = []
+        if isinstance(root, dict) and isinstance(root.get("hypotheses"), list):
+            for entry in root.get("hypotheses", []):
+                if not isinstance(entry, dict):
+                    continue
+                points, labels = self._parse_positions(
+                    entry.get("waypoints", entry.get("positions", [])),
+                    labels=entry.get("load_labels", []),
+                )
+                if len(points) < 4:
+                    continue
+                confidence = float(entry.get("confidence", 1.0))
+                load_frac = entry.get("load_fractions", entry.get("lambda", None))
+                hypotheses.append(self._build_hypothesis(points, labels, confidence, load_frac))
+        else:
+            single = self._vlm_json_formation()
+            if single is not None:
+                points, labels, conf = single
+                hypotheses.append(self._build_hypothesis(points, labels, conf))
+        return hypotheses
+
+    def _set_active_hypothesis(self, index: int, obj_center: Optional[np.ndarray] = None) -> None:
+        if not self.vlm_hypothesis_assignments:
+            return
+        idx = int(np.clip(index, 0, len(self.vlm_hypothesis_assignments) - 1))
+        self.vlm_selected_idx = idx
+        if obj_center is None:
+            obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
+            obj_center = np.array(obj_pos, dtype=np.float32)
+        assignment = self.vlm_hypothesis_assignments[idx]
+        for robot, waypoint in zip(self.robots, assignment):
+            waypoint = np.array(waypoint, dtype=np.float32)
+            robot.waypoint = waypoint
+            robot.waypoint_offset = waypoint - obj_center
 
     def _geometric_fallback(self, dims: Tuple[float, float, float]) -> Tuple[List[Tuple[float, float]], List[str]]:
         length, width, _ = dims

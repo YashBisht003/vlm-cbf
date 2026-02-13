@@ -203,17 +203,7 @@ For large-scale training:
 
 ---
 
-## 📄 Citation
 
-If you use this work:
-
-```bibtex
-@inproceedings{vlmcbf2026,
-  title={Vision-Language Guided Safe Multi-Robot Cooperative Manipulation via Probe-and-Correct},
-  author={Bisht, Yash and ...},
-  booktitle={IEEE/RSJ IROS},
-  year={2026}
-}
 ```
 
 ---

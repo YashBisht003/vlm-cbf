@@ -38,6 +38,19 @@ def _parse_args() -> argparse.Namespace:
         help="Disable checkpoint verification during training",
     )
     parser.add_argument("--torch-threads", type=int, default=0, help="Torch CPU threads (0=default)")
+    parser.add_argument("--num-envs", type=int, default=1, help="Parallel env instances for MAPPO data collection")
+    parser.add_argument(
+        "--pretrain-neural-cbf-steps",
+        type=int,
+        default=0,
+        help="Random rollout steps for neural CBF pretraining before MAPPO updates",
+    )
+    parser.add_argument(
+        "--pretrain-neural-cbf-epochs",
+        type=int,
+        default=3,
+        help="Epochs for the neural CBF pretraining stage",
+    )
     parser.add_argument(
         "--carry-mode",
         choices=("auto", "constraint", "kinematic"),
@@ -288,6 +301,12 @@ def main() -> None:
             str(policy_out),
             "--log-csv",
             str(train_csv),
+            "--num-envs",
+            str(args.num_envs),
+            "--pretrain-neural-cbf-steps",
+            str(args.pretrain_neural_cbf_steps),
+            "--pretrain-neural-cbf-epochs",
+            str(args.pretrain_neural_cbf_epochs),
         ]
         if args.torch_threads > 0:
             train_cmd.extend(["--torch-threads", str(args.torch_threads)])

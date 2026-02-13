@@ -134,6 +134,7 @@ class TaskConfig:
     phase_approach_min_ready: int = 4
     phase_allow_quorum_fallback: bool = False
     phase_contact_force_threshold: float = 5.0
+    phase_contact_timeout_s: float = 5.0
     phase_correct_settle_dist: float = 0.08
     phase_correct_settle_s: float = 0.25
     phase_lift_stability_s: float = 1.0
@@ -148,6 +149,7 @@ class TaskConfig:
     probe_duration_max_s: float = 2.5
     probe_ramp_s: float = 0.8
     probe_ground_unloading_ratio: float = 0.30
+    probe_safety_alpha: float = 0.5
     probe_force_sigma: float = 0.15
     probe_residual_gain: float = 0.12
     probe_residual_max: float = 0.12
@@ -155,6 +157,11 @@ class TaskConfig:
     residual_model_path: Optional[str] = None
     probe_use_learned_residual: bool = True
     enable_probe_correct: bool = True
+    contact_retry_limit: int = 2
+    contact_waypoint_perturb_sigma: float = 0.05
+    contact_fallback_spacing_scale: float = 1.25
+    enable_contact_degraded_mode: bool = True
+    degraded_capacity_margin: float = 0.70
 
     heavy_urdf: Optional[str] = None
     agile_urdf: Optional[str] = None
@@ -332,8 +339,14 @@ class VlmCbfEnv:
         self.vlm_hypothesis_assignments: List[List[np.ndarray]] = []
         self.vlm_selected_idx: int = 0
         self.vlm_posterior: List[float] = []
+        self.contact_retry_count: int = 0
+        self.contact_fallback_applied: bool = False
+        self.inactive_robot_names: set[str] = set()
+        self.failed_contact_robot: Optional[str] = None
+        self.degraded_mode_active: bool = False
         self.probe_started_at: Optional[float] = None
         self.probe_force_target: float = 0.0
+        self.probe_force_target_per_robot: List[float] = [0.0, 0.0, 0.0, 0.0]
         self.probe_force_measured: float = 0.0
         self.probe_load_fraction_measured: List[float] = [0.25, 0.25, 0.25, 0.25]
         self.probe_ground_unloading: float = 0.0
@@ -358,20 +371,23 @@ class VlmCbfEnv:
                 r_meas=self.cfg.ekf_r_meas,
                 r_yaw=self.cfg.ekf_r_yaw,
             )
-            obj_pos, obj_quat = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
-            obj_yaw = _yaw_from_quat(obj_quat)
-            self.object_belief.update((float(obj_pos[0]), float(obj_pos[1]), float(obj_yaw)))
+            if self.object_spec is not None:
+                self.object_belief.initialize(
+                    mass_kg=float(self.object_spec.mass),
+                    com_offset_xyz=self.object_spec.com_offset,
+                    dims_xyz=self.object_spec.dims,
+                )
         if self.cfg.use_neural_cbf and self.neural_cbf is None:
             try:
                 self.neural_cbf = NeuralCbfRuntime(
-                    mu_dim=6,
+                    mu_dim=7,
                     hidden=self.cfg.neural_cbf_hidden,
                     model_path=self.cfg.neural_cbf_model_path,
                     device=self.cfg.neural_cbf_device,
                 )
-            except FileNotFoundError:
+            except Exception:
                 self.neural_cbf = NeuralCbfRuntime(
-                    mu_dim=6,
+                    mu_dim=7,
                     hidden=self.cfg.neural_cbf_hidden,
                     model_path=None,
                     device=self.cfg.neural_cbf_device,
@@ -434,7 +450,10 @@ class VlmCbfEnv:
             "belief": {
                 "mu": belief_mean.tolist(),
                 "cov_diag": np.diag(belief_cov).astype(np.float32).tolist(),
-                "uncertainty_pos": float(np.sqrt(max(0.0, np.trace(belief_cov[:2, :2])))),
+                "uncertainty_pos": float(np.sqrt(max(0.0, np.trace(belief_cov[1:3, 1:3])))),
+                "uncertainty_mass_rel": float(
+                    np.sqrt(max(0.0, belief_cov[0, 0])) / max(1e-3, abs(float(belief_mean[0])))
+                ),
             },
             "phase_sync": {
                 "last_delay_ms": float(self.phase_sync_last_delay_ms),
@@ -444,12 +463,20 @@ class VlmCbfEnv:
             "probe": {
                 "started_at": None if self.probe_started_at is None else float(self.probe_started_at),
                 "force_target": float(self.probe_force_target),
+                "force_target_per_robot": [float(v) for v in self.probe_force_target_per_robot],
                 "force_measured": float(self.probe_force_measured),
                 "load_fraction_measured": [float(v) for v in self.probe_load_fraction_measured],
                 "ground_unloading": float(self.probe_ground_unloading),
                 "posterior": [float(v) for v in self.vlm_posterior],
                 "selected_idx": int(self.vlm_selected_idx),
                 "residual_mode": str(self.probe_residual_mode),
+            },
+            "contact": {
+                "retry_count": int(self.contact_retry_count),
+                "fallback_applied": bool(self.contact_fallback_applied),
+                "degraded_mode": bool(self.degraded_mode_active),
+                "inactive_robots": sorted(list(self.inactive_robot_names)),
+                "failed_robot": self.failed_contact_robot,
             },
         }
         return obs, info
@@ -1026,6 +1053,9 @@ class VlmCbfEnv:
         return ready
 
     def _phase_local_ready(self, robot: RobotInstance) -> bool:
+        if robot.spec.name in self.inactive_robot_names:
+            return True
+
         if self.phase == Phase.APPROACH:
             if robot.waypoint is None:
                 return False
@@ -1142,6 +1172,8 @@ class VlmCbfEnv:
             self.probe_started_at = None
             self.probe_force_measured = 0.0
             self.probe_ground_unloading = 0.0
+            self.probe_force_target = 0.0
+            self.probe_force_target_per_robot = [0.0 for _ in self.robots]
             return
         if self.probe_started_at is None:
             self.probe_started_at = self.sim_time
@@ -1154,11 +1186,24 @@ class VlmCbfEnv:
 
         weight = max(1e-6, float(self.object_spec.mass) * 9.81)
         self.probe_ground_unloading = float(np.clip(total_force / weight, 0.0, 2.0))
-
-        weakest_force_cap = min(float(robot.spec.payload) * 9.81 for robot in self.robots)
-        team_probe = 0.15 * weight
-        capped = float(self.cfg.probe_weak_robot_force_frac) * weakest_force_cap * len(self.robots)
-        self.probe_force_target = min(team_probe, capped)
+        payload_caps = np.asarray([max(1.0, float(robot.spec.payload) * 9.81) for robot in self.robots], dtype=np.float32)
+        if self.vlm_hypotheses:
+            top_idx = int(np.argmax([float(h.confidence) for h in self.vlm_hypotheses]))
+            lambda_top = np.asarray(self.vlm_hypotheses[top_idx].load_fractions, dtype=np.float32)
+            lambda_stack = np.stack([np.asarray(h.load_fractions, dtype=np.float32) for h in self.vlm_hypotheses], axis=0)
+            lambda_worst = np.max(lambda_stack, axis=0)
+        else:
+            lambda_top = np.full(len(self.robots), 1.0 / max(1, len(self.robots)), dtype=np.float32)
+            lambda_worst = lambda_top.copy()
+        lambda_top = np.clip(lambda_top, 1e-3, None)
+        lambda_top = lambda_top / float(np.sum(lambda_top))
+        lambda_worst = np.clip(lambda_worst, 1e-3, None)
+        fprobe_candidates = float(self.cfg.probe_safety_alpha) * payload_caps / lambda_worst
+        fprobe = float(np.min(fprobe_candidates))
+        per_robot = (fprobe * lambda_top).astype(np.float32)
+        per_robot = np.minimum(per_robot, float(self.cfg.probe_safety_alpha) * payload_caps)
+        self.probe_force_target_per_robot = per_robot.astype(np.float32).tolist()
+        self.probe_force_target = float(np.sum(per_robot))
 
     def _probe_done(self) -> bool:
         if self.phase != Phase.PROBE:
@@ -1223,7 +1268,7 @@ class VlmCbfEnv:
         posterior_max = float(max(self.vlm_posterior)) if self.vlm_posterior else 0.0
         selected_conf = float(self.vlm_hypotheses[idx].confidence) if idx < len(self.vlm_hypotheses) else 0.0
         belief_mu, belief_cov = self._belief_snapshot()
-        belief_unc_pos = float(np.sqrt(max(0.0, np.trace(belief_cov[:2, :2]))))
+        belief_unc_pos = float(np.sqrt(max(0.0, np.trace(belief_cov[1:3, 1:3]))))
         dims = self.object_spec.dims if self.object_spec is not None else (1.0, 1.0, 1.0)
         mass = float(self.object_spec.mass) if self.object_spec is not None else 50.0
         self.probe_residual_mode = "heuristic"
@@ -1289,10 +1334,19 @@ class VlmCbfEnv:
             mu = self.object_belief.mean().astype(np.float32)
             cov = self.object_belief.covariance().astype(np.float32)
             return mu, cov
-        obj_pos, obj_quat = self._get_object_pose(noisy=False)
-        obj_yaw = _yaw_from_quat(obj_quat)
-        mu = np.array([obj_pos[0], obj_pos[1], obj_yaw, 0.0, 0.0, 0.0], dtype=np.float32)
-        cov = np.eye(6, dtype=np.float32) * 1e-3
+        if self.object_spec is not None:
+            mass = float(self.object_spec.mass)
+            com = np.asarray(self.object_spec.com_offset, dtype=np.float32).reshape(3)
+            dims = np.asarray(self.object_spec.dims, dtype=np.float32).reshape(3)
+            lx, ly, lz = [float(max(1e-3, v)) for v in dims]
+            ixx = mass * (ly * ly + lz * lz) / 12.0
+            iyy = mass * (lx * lx + lz * lz) / 12.0
+            izz = mass * (lx * lx + ly * ly) / 12.0
+            mu = np.array([mass, com[0], com[1], com[2], ixx, iyy, izz], dtype=np.float32)
+            cov = np.diag([25.0, 0.02, 0.02, 0.02, 5.0, 5.0, 5.0]).astype(np.float32)
+            return mu, cov
+        mu = np.array([100.0, 0.0, 0.0, 0.0, 5.0, 5.0, 5.0], dtype=np.float32)
+        cov = np.diag([100.0, 0.05, 0.05, 0.05, 10.0, 10.0, 10.0]).astype(np.float32)
         return mu, cov
 
     def _risk_factor(self, severity: float, metric: float) -> float:
@@ -1330,13 +1384,14 @@ class VlmCbfEnv:
                 neighbor_vel.append(self.last_safe_vel.get(other.base_id, np.zeros(2, dtype=np.float32)))
 
         belief_mu, belief_cov = self._belief_snapshot()
-        pos_unc = float(np.sqrt(max(0.0, np.trace(belief_cov[:2, :2]))))
-        yaw_unc = float(np.sqrt(max(0.0, belief_cov[2, 2])))
+        com_unc = float(np.sqrt(max(0.0, np.trace(belief_cov[1:3, 1:3]))))
+        mass_rel_unc = float(np.sqrt(max(0.0, belief_cov[0, 0])) / max(1e-3, abs(float(belief_mu[0]))))
+        inertia_unc = float(np.sqrt(max(0.0, np.trace(belief_cov[4:7, 4:7]))))
 
-        eta_speed = self._risk_factor(self.cfg.cbf_risk_s_speed, pos_unc)
-        eta_sep = self._risk_factor(self.cfg.cbf_risk_s_sep, pos_unc)
-        eta_force = self._risk_factor(self.cfg.cbf_risk_s_force, pos_unc + 0.5 * yaw_unc)
-        eta_neural = self._risk_factor(self.cfg.cbf_risk_s_neural, pos_unc + yaw_unc)
+        eta_speed = self._risk_factor(self.cfg.cbf_risk_s_speed, com_unc)
+        eta_sep = self._risk_factor(self.cfg.cbf_risk_s_sep, com_unc)
+        eta_force = self._risk_factor(self.cfg.cbf_risk_s_force, com_unc + mass_rel_unc + 0.2 * inertia_unc)
+        eta_neural = self._risk_factor(self.cfg.cbf_risk_s_neural, com_unc + mass_rel_unc + 0.2 * inertia_unc)
 
         v_max = self.cfg.speed_limit / max(eta_speed, 1e-3)
         if self.phase in (Phase.FINE_APPROACH, Phase.CONTACT, Phase.PROBE):
@@ -1356,7 +1411,8 @@ class VlmCbfEnv:
             normal_xy = rel / rel_norm
         else:
             normal_xy = np.zeros(2, dtype=np.float32)
-        obj_vel_xy = np.asarray(belief_mu[3:5], dtype=np.float32)
+        obj_lin_vel, _obj_ang_vel = p.getBaseVelocity(self.object_id, physicsClientId=self.client_id)
+        obj_vel_xy = np.asarray(obj_lin_vel[:2], dtype=np.float32)
 
         force_norm_scale = max(self.cfg.contact_force_max, 1e-6)
         force_n0 = contact_force / force_norm_scale
@@ -1780,9 +1836,22 @@ class VlmCbfEnv:
         self.phase_time += self.control_dt
         if self.cfg.use_ekf and self.object_belief is not None:
             self.object_belief.predict()
-            meas_pos, meas_quat = self._get_object_pose(noisy=True)
-            meas_yaw = _yaw_from_quat(meas_quat)
-            self.object_belief.update((float(meas_pos[0]), float(meas_pos[1]), float(meas_yaw)))
+            obj_pos, _obj_quat = self._get_object_pose(noisy=False)
+            robot_xy = []
+            forces = []
+            for robot in self.robots:
+                base_pos, _ = self._get_robot_pose(robot, noisy=False)
+                robot_xy.append([float(base_pos[0]), float(base_pos[1])])
+                force_i = max(0.0, float(self._contact_force(robot)))
+                if self.cfg.sensor_force_noise > 0.0:
+                    force_i += float(self.rng.normal(0.0, self.cfg.sensor_force_noise))
+                    force_i = max(0.0, force_i)
+                forces.append(force_i)
+            self.object_belief.update(
+                forces_z=forces,
+                robot_positions_xy=robot_xy,
+                object_center_xy=[float(obj_pos[0]), float(obj_pos[1])],
+            )
         self._update_lift_target()
         self._maybe_fallback_carry_mode()
         self._carry_object_if_needed()
@@ -1883,6 +1952,123 @@ class VlmCbfEnv:
                 return False
         return True
 
+    def _contact_ready_names(self) -> List[str]:
+        names: List[str] = []
+        for robot in self.robots:
+            if robot.spec.name in self.inactive_robot_names:
+                continue
+            if self._phase_local_ready(robot):
+                names.append(robot.spec.name)
+        return names
+
+    def _perturb_waypoints_for_retry(self) -> None:
+        sigma = max(0.0, float(self.cfg.contact_waypoint_perturb_sigma))
+        if sigma <= 0.0:
+            return
+        for robot in self.robots:
+            if robot.spec.name in self.inactive_robot_names:
+                continue
+            if robot.waypoint is None:
+                continue
+            wp = np.asarray(robot.waypoint, dtype=np.float32).copy()
+            wp[:2] += self.rng.normal(0.0, sigma, size=2).astype(np.float32)
+            robot.waypoint = wp
+
+    def _apply_geometric_fallback_formation(self, spacing_scale: float = 1.0) -> None:
+        if self.object_id is None or self.object_spec is None:
+            return
+        obj_pos, obj_quat = self._get_object_pose(noisy=False)
+        dims = tuple(float(v) for v in self.object_spec.dims)
+        points, labels = self._geometric_fallback(dims)
+        scale = max(0.5, float(spacing_scale))
+        scaled_pts = [(float(x) * scale, float(y) * scale) for x, y in points]
+        fallback_h = self._build_hypothesis(scaled_pts, labels, confidence=1.0)
+        world_waypoints = self._to_world_waypoints(obj_pos, obj_quat, fallback_h.waypoints_local)
+        assigned = self._assign_robots(world_waypoints, fallback_h.load_labels)
+        self.vlm_hypotheses = [fallback_h]
+        self.vlm_hypothesis_assignments = [[np.array(wp, dtype=np.float32) for wp in assigned]]
+        self._set_active_hypothesis(0)
+
+    def _activate_degraded_mode_if_safe(self) -> bool:
+        if not self.cfg.enable_contact_degraded_mode:
+            return False
+        if self.object_spec is None:
+            return False
+        ready = set(self._contact_ready_names())
+        missing = [
+            robot
+            for robot in self.robots
+            if robot.spec.name not in ready and robot.spec.name not in self.inactive_robot_names
+        ]
+        if len(missing) != 1:
+            return False
+        failed_robot = missing[0]
+        if failed_robot.spec.payload >= 100.0:
+            return False
+
+        active_payload = sum(
+            float(robot.spec.payload)
+            for robot in self.robots
+            if robot.spec.name != failed_robot.spec.name and robot.spec.name not in self.inactive_robot_names
+        )
+        cap_kg = float(self.cfg.degraded_capacity_margin) * active_payload
+        if float(self.object_spec.mass) > cap_kg:
+            return False
+
+        self.inactive_robot_names.add(failed_robot.spec.name)
+        self.failed_contact_robot = failed_robot.spec.name
+        self.degraded_mode_active = True
+        for robot in self.robots:
+            if robot.spec.name == failed_robot.spec.name:
+                robot.grip_active = False
+                self._maybe_detach(robot, reason="release")
+                base_pos, _ = self._get_robot_pose(robot, noisy=False)
+                robot.waypoint = np.array(base_pos[:2], dtype=np.float32)
+
+        if self.vlm_hypotheses:
+            idx_failed = None
+            for i, robot in enumerate(self.robots):
+                if robot.spec.name == failed_robot.spec.name:
+                    idx_failed = i
+                    break
+            if idx_failed is not None:
+                for hyp in self.vlm_hypotheses:
+                    frac = np.asarray(hyp.load_fractions, dtype=np.float32).copy()
+                    if idx_failed < frac.shape[0]:
+                        frac[idx_failed] = 0.0
+                        s = float(np.sum(frac))
+                        if s > 1e-6:
+                            frac = frac / s
+                        else:
+                            frac[:] = 0.0
+                        hyp.load_fractions = frac.astype(np.float32)
+        return True
+
+    def _handle_contact_timeout(self) -> bool:
+        if self.phase != Phase.CONTACT:
+            return False
+        if self._activate_degraded_mode_if_safe():
+            self.phase_time = 0.0
+            return True
+
+        if self.contact_retry_count < max(0, int(self.cfg.contact_retry_limit)):
+            self.contact_retry_count += 1
+            self._perturb_waypoints_for_retry()
+            self.phase = Phase.FINE_APPROACH
+            self.phase_time = 0.0
+            return True
+
+        if not self.contact_fallback_applied:
+            self.contact_fallback_applied = True
+            self._apply_geometric_fallback_formation(spacing_scale=self.cfg.contact_fallback_spacing_scale)
+            self.phase = Phase.APPROACH
+            self.phase_time = 0.0
+            return True
+
+        self.phase = Phase.DONE
+        self.phase_time = 0.0
+        return True
+
     def _update_phase(self) -> None:
         if self.cfg.use_udp_phase and self.udp_bus is not None:
             self._update_phase_distributed()
@@ -1918,11 +2104,15 @@ class VlmCbfEnv:
                 self.phase_time = 0.0
                 return
 
-        if self.phase == Phase.CONTACT and self._all_gripping():
-            self.phase = Phase.PROBE if self.cfg.enable_probe_correct else Phase.LIFT
-            self.phase_time = 0.0
-            self.probe_started_at = None
-            return
+        if self.phase == Phase.CONTACT:
+            if self._all_gripping():
+                self.phase = Phase.PROBE if self.cfg.enable_probe_correct else Phase.LIFT
+                self.phase_time = 0.0
+                self.probe_started_at = None
+                return
+            if self.phase_time >= self.cfg.phase_contact_timeout_s:
+                if self._handle_contact_timeout():
+                    return
 
         if self.phase == Phase.PROBE and self._probe_done():
             self._select_probe_hypothesis()
@@ -1969,6 +2159,9 @@ class VlmCbfEnv:
 
         ready, delay = self._phase_consensus_ready()
         if not ready:
+            if self.phase == Phase.CONTACT and self.phase_time >= self.cfg.phase_contact_timeout_s:
+                if self._handle_contact_timeout():
+                    return
             # Optional timeout fallback for difficult approach deadlocks.
             if (
                 self.cfg.phase_allow_quorum_fallback
@@ -1996,10 +2189,14 @@ class VlmCbfEnv:
             return
 
         if self.phase == Phase.CONTACT:
-            self.phase = Phase.PROBE if self.cfg.enable_probe_correct else Phase.LIFT
-            self.phase_time = 0.0
-            self.probe_started_at = None
-            return
+            if not self._all_gripping():
+                if self.phase_time >= self.cfg.phase_contact_timeout_s and self._handle_contact_timeout():
+                    return
+            else:
+                self.phase = Phase.PROBE if self.cfg.enable_probe_correct else Phase.LIFT
+                self.phase_time = 0.0
+                self.probe_started_at = None
+                return
 
         if self.phase == Phase.PROBE:
             self._select_probe_hypothesis()
@@ -2342,7 +2539,12 @@ class VlmCbfEnv:
         return True
 
     def _all_gripping(self) -> bool:
-        return all(robot.grip_active for robot in self.robots)
+        for robot in self.robots:
+            if robot.spec.name in self.inactive_robot_names:
+                continue
+            if not robot.grip_active:
+                return False
+        return True
 
     def _object_near_goal(self) -> bool:
         obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)

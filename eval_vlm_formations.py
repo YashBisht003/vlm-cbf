@@ -10,7 +10,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from infer_vlm_llava import infer_with_loaded, load_model_and_processor
-from vlm_llava_utils import extract_ground_truth, parse_waypoints
+from vlm_llava_utils import extract_ground_truth, parse_hypotheses, parse_waypoints
 
 
 def _parse_args() -> argparse.Namespace:
@@ -28,6 +28,11 @@ def _parse_args() -> argparse.Namespace:
         help="Mean waypoint distance threshold for formation correctness (m)",
     )
     parser.add_argument("--max-samples", type=int, default=0, help="Max samples (0=all)")
+    parser.add_argument(
+        "--oracle-hypothesis",
+        action="store_true",
+        help="Evaluate best hypothesis among returned K (diagnostic upper bound)",
+    )
     parser.add_argument("--out-csv", default="vlm_eval_samples.csv", help="Per-sample output CSV")
     parser.add_argument("--out-json", default="vlm_eval_metrics.json", help="Aggregate metrics JSON")
     return parser.parse_args()
@@ -93,7 +98,25 @@ def main() -> None:
             processor=processor,
             image_path=image_path,
         )
-        pred_waypoints = parse_waypoints(pred_obj if isinstance(pred_obj, dict) else {})
+        hypotheses = parse_hypotheses(pred_obj if isinstance(pred_obj, dict) else {}, k=3)
+        pred_waypoints = None
+        if hypotheses:
+            if args.oracle_hypothesis:
+                best_d = None
+                best_w = None
+                for hyp in hypotheses:
+                    cand_w = hyp.get("waypoints", None)
+                    if cand_w is None:
+                        continue
+                    d_tmp, _ = _assignment_error(cand_w, gt["waypoints"])
+                    if best_d is None or d_tmp < best_d:
+                        best_d = d_tmp
+                        best_w = cand_w
+                pred_waypoints = best_w
+            else:
+                pred_waypoints = hypotheses[0].get("waypoints", None)
+        if pred_waypoints is None:
+            pred_waypoints = parse_waypoints(pred_obj if isinstance(pred_obj, dict) else {})
         confidence = float((pred_obj or {}).get("confidence", 0.0)) if isinstance(pred_obj, dict) else 0.0
         fallback = int(confidence < args.confidence_threshold or pred_waypoints is None)
         if fallback:

@@ -34,6 +34,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto", help="cpu, cuda, or auto")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--torch-threads", type=int, default=0, help="Torch CPU threads (0 = default)")
+    parser.add_argument("--num-envs", type=int, default=1, help="Number of parallel environment instances")
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
     parser.add_argument(
         "--carry-mode",
@@ -171,6 +172,18 @@ def _parse_args() -> argparse.Namespace:
         help="Extra intervention penalty scaled by belief uncertainty",
     )
     parser.add_argument("--train-neural-cbf", action="store_true", help="Train neural CBF online from rollout data")
+    parser.add_argument(
+        "--pretrain-neural-cbf-steps",
+        type=int,
+        default=0,
+        help="Random-policy rollout steps for neural CBF pretraining before PPO updates",
+    )
+    parser.add_argument(
+        "--pretrain-neural-cbf-epochs",
+        type=int,
+        default=3,
+        help="Epochs for neural CBF pretraining stage",
+    )
     parser.add_argument("--neural-cbf-lr", type=float, default=1e-3, help="Neural CBF optimizer learning rate")
     parser.add_argument("--neural-cbf-epochs", type=int, default=2, help="Neural CBF update epochs per PPO update")
     parser.add_argument("--neural-cbf-margin", type=float, default=0.0, help="Margin for temporal neural CBF residual loss")
@@ -406,12 +419,117 @@ def _verify_checkpoint(path: Path, expected_update: int) -> None:
         )
 
 
+def _fit_neural_cbf(
+    env: VlmCbfEnv,
+    optimizer: optim.Optimizer,
+    args: argparse.Namespace,
+    x_prev_arr: np.ndarray,
+    x_next_arr: np.ndarray,
+    safe_arr: np.ndarray,
+    weight_arr: np.ndarray,
+    epochs: int,
+    rng: np.random.Generator,
+) -> float:
+    if env.neural_cbf is None or x_prev_arr.size == 0:
+        return 0.0
+    model = env.neural_cbf.model
+    model.train()
+    idx = np.arange(x_prev_arr.shape[0])
+    loss_acc = 0.0
+    loss_count = 0
+    epochs_eff = max(1, int(epochs))
+    for _ in range(epochs_eff):
+        rng.shuffle(idx)
+        for start in range(0, len(idx), args.minibatch):
+            batch_idx = idx[start : start + args.minibatch]
+            batch_x_prev = torch.tensor(x_prev_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
+            batch_x_next = torch.tensor(x_next_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
+            batch_safe = torch.tensor(safe_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
+            batch_w = torch.tensor(weight_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
+            h_prev = model(batch_x_prev)
+            h_next = model(batch_x_next)
+            residual = h_next - h_prev + float(args.neural_cbf_train_alpha * env.control_dt) * h_prev
+            residual_loss = torch.relu(float(args.neural_cbf_margin) - residual).pow(2)
+            safe_pen = torch.relu(0.1 - h_next).pow(2)
+            unsafe_pen = torch.relu(h_next + 0.1).pow(2)
+            cls_pen = batch_safe * safe_pen + (1.0 - batch_safe) * unsafe_pen
+            loss = (batch_w * (residual_loss + float(args.neural_cbf_cls_lambda) * cls_pen)).mean()
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            loss_acc += float(loss.item())
+            loss_count += 1
+    model.eval()
+    return loss_acc / max(loss_count, 1)
+
+
+def _collect_neural_cbf_samples(
+    env: VlmCbfEnv,
+    steps: int,
+    rng: np.random.Generator,
+    unsafe_weight: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    prev_neural_by_robot: Dict[str, Tuple[np.ndarray, float]] = {}
+    samples_prev: List[np.ndarray] = []
+    samples_next: List[np.ndarray] = []
+    samples_safe: List[float] = []
+    samples_weight: List[float] = []
+    env.reset()
+    for _ in range(max(0, int(steps))):
+        random_actions: Dict[int, RobotAction] = {}
+        for robot in env.robots:
+            vx = float(rng.uniform(-1.0, 1.0)) * env.cfg.speed_limit
+            vy = float(rng.uniform(-1.0, 1.0)) * env.cfg.speed_limit
+            yaw = float(rng.uniform(-1.0, 1.0)) * env.cfg.yaw_rate_max
+            grip = bool(rng.uniform() > 0.5)
+            random_actions[robot.base_id] = RobotAction(base_vel=(vx, vy, yaw), grip=grip)
+        _obs, info = env.step(random_actions)
+        for robot_name, robot_metrics in env.cbf_step_metrics.items():
+            neural_input = robot_metrics.get("neural_input")
+            h_curr = float(robot_metrics.get("neural_barrier", 0.0))
+            prev_sample = prev_neural_by_robot.get(robot_name)
+            if prev_sample is not None and neural_input is not None:
+                prev_input, _ = prev_sample
+                force_safe = float(robot_metrics.get("force_barrier_raw", -1.0)) >= 0.0
+                constraint_safe = float(robot_metrics.get("neural_constraint_margin", -1.0)) >= -1e-4
+                safe_label = 1.0 if (force_safe and constraint_safe) else 0.0
+                sample_weight = 1.0 if safe_label >= 0.5 else float(unsafe_weight)
+                samples_prev.append(np.asarray(prev_input, dtype=np.float32))
+                samples_next.append(np.asarray(neural_input, dtype=np.float32))
+                samples_safe.append(float(safe_label))
+                samples_weight.append(float(sample_weight))
+            if neural_input is not None:
+                prev_neural_by_robot[robot_name] = (np.asarray(neural_input, dtype=np.float32), h_curr)
+            else:
+                prev_neural_by_robot.pop(robot_name, None)
+        if info.get("phase") == "done":
+            env.reset()
+            prev_neural_by_robot.clear()
+
+    if not samples_prev:
+        return (
+            np.zeros((0, 1), dtype=np.float32),
+            np.zeros((0, 1), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+            np.zeros((0,), dtype=np.float32),
+        )
+    return (
+        np.stack(samples_prev).astype(np.float32),
+        np.stack(samples_next).astype(np.float32),
+        np.asarray(samples_safe, dtype=np.float32),
+        np.asarray(samples_weight, dtype=np.float32),
+    )
+
+
 def main() -> None:
     args = _parse_args()
     if args.updates <= 0:
         raise ValueError("--updates must be > 0")
     if args.steps_per_update <= 0:
         raise ValueError("--steps-per-update must be > 0")
+    if args.num_envs <= 0:
+        raise ValueError("--num-envs must be > 0")
     if args.save_every <= 0:
         raise ValueError("--save-every must be > 0")
     device = _select_device(args.device)
@@ -425,43 +543,50 @@ def main() -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    cfg = TaskConfig(
-        gui=not args.headless,
-        random_seed=args.seed,
-        carry_mode=args.carry_mode,
-        robot_size_mode=args.robot_size_mode,
-        object_size_ratio=(args.size_ratio_min, args.size_ratio_max),
-        constraint_force_scale=args.constraint_force_scale,
-        vacuum_attach_dist=args.vacuum_attach_dist,
-        vacuum_break_dist=args.vacuum_break_dist,
-        vacuum_force_margin=args.vacuum_force_margin,
-        base_drive_mode=args.base_drive_mode,
-        phase_approach_dist=args.phase_approach_dist,
-        phase_approach_timeout_s=args.phase_approach_timeout_s,
-        phase_approach_min_ready=args.phase_approach_min_ready,
-        phase_allow_quorum_fallback=args.phase_allow_quorum_fallback,
-        use_udp_phase=args.udp_phase,
-        use_udp_neighbor_state=args.udp_neighbor_state,
-        udp_base_port=args.udp_base_port,
-        cbf_risk_s_speed=args.cbf_risk_s_speed,
-        cbf_risk_s_sep=args.cbf_risk_s_sep,
-        cbf_risk_s_force=args.cbf_risk_s_force,
-        cbf_risk_s_neural=args.cbf_risk_s_neural,
-        use_neural_cbf=args.use_neural_cbf,
-        neural_cbf_model_path=(args.neural_cbf_model if args.neural_cbf_model else None),
-        neural_cbf_hidden=args.neural_cbf_hidden,
-        neural_cbf_device=args.neural_cbf_device,
-        neural_cbf_alpha=args.neural_cbf_alpha,
-        neural_cbf_force_vel_gain=args.neural_cbf_force_vel_gain,
-        cbf_eps=args.cbf_epsilon,
-        residual_model_path=(args.residual_model if args.residual_model else None),
-        probe_use_learned_residual=not args.no_learned_residual,
-        enable_probe_correct=not args.no_probe_correct,
-    )
-    env = VlmCbfEnv(cfg)
-    env.reset()
+    def _make_cfg(env_idx: int) -> TaskConfig:
+        env_seed = int(seed + env_idx * 9973)
+        # Avoid UDP port collisions across parallel env instances.
+        env_udp_port = int(args.udp_base_port + env_idx * 50)
+        return TaskConfig(
+            gui=not args.headless,
+            random_seed=env_seed,
+            carry_mode=args.carry_mode,
+            robot_size_mode=args.robot_size_mode,
+            object_size_ratio=(args.size_ratio_min, args.size_ratio_max),
+            constraint_force_scale=args.constraint_force_scale,
+            vacuum_attach_dist=args.vacuum_attach_dist,
+            vacuum_break_dist=args.vacuum_break_dist,
+            vacuum_force_margin=args.vacuum_force_margin,
+            base_drive_mode=args.base_drive_mode,
+            phase_approach_dist=args.phase_approach_dist,
+            phase_approach_timeout_s=args.phase_approach_timeout_s,
+            phase_approach_min_ready=args.phase_approach_min_ready,
+            phase_allow_quorum_fallback=args.phase_allow_quorum_fallback,
+            use_udp_phase=args.udp_phase,
+            use_udp_neighbor_state=args.udp_neighbor_state,
+            udp_base_port=env_udp_port,
+            cbf_risk_s_speed=args.cbf_risk_s_speed,
+            cbf_risk_s_sep=args.cbf_risk_s_sep,
+            cbf_risk_s_force=args.cbf_risk_s_force,
+            cbf_risk_s_neural=args.cbf_risk_s_neural,
+            use_neural_cbf=args.use_neural_cbf,
+            neural_cbf_model_path=(args.neural_cbf_model if args.neural_cbf_model else None),
+            neural_cbf_hidden=args.neural_cbf_hidden,
+            neural_cbf_device=args.neural_cbf_device,
+            neural_cbf_alpha=args.neural_cbf_alpha,
+            neural_cbf_force_vel_gain=args.neural_cbf_force_vel_gain,
+            cbf_eps=args.cbf_epsilon,
+            residual_model_path=(args.residual_model if args.residual_model else None),
+            probe_use_learned_residual=not args.no_learned_residual,
+            enable_probe_correct=not args.no_probe_correct,
+        )
+
+    envs: List[VlmCbfEnv] = [VlmCbfEnv(_make_cfg(i)) for i in range(int(args.num_envs))]
+    for env in envs:
+        env.reset()
+    env = envs[0]
     neural_cbf_opt: Optional[optim.Optimizer] = None
-    if args.train_neural_cbf and cfg.use_neural_cbf and env.neural_cbf is not None:
+    if args.train_neural_cbf and env.cfg.use_neural_cbf and env.neural_cbf is not None:
         neural_cbf_opt = optim.Adam(env.neural_cbf.model.parameters(), lr=args.neural_cbf_lr)
 
     n_agents = len(env.robots)
@@ -475,6 +600,22 @@ def main() -> None:
     checkpoint_path = Path(args.out)
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    def _close_envs() -> None:
+        for e in envs:
+            try:
+                e.close()
+            except Exception:
+                pass
+
+    def _sync_neural_runtime() -> None:
+        if env.neural_cbf is None:
+            return
+        state = env.neural_cbf.model.state_dict()
+        for other in envs[1:]:
+            if other.neural_cbf is not None:
+                other.neural_cbf.model.load_state_dict(state)
+                other.neural_cbf.model.eval()
 
     start_update = 1
     best_metric = -1e9
@@ -526,16 +667,49 @@ def main() -> None:
         if not loaded:
             print("Resume requested but no checkpoint was loaded; starting from update 1.")
 
+    if (
+        neural_cbf_opt is not None
+        and env.neural_cbf is not None
+        and int(args.pretrain_neural_cbf_steps) > 0
+        and start_update <= 1
+    ):
+        x_prev, x_next, safe_lbl, sample_w = _collect_neural_cbf_samples(
+            env=env,
+            steps=int(args.pretrain_neural_cbf_steps),
+            rng=rng,
+            unsafe_weight=float(args.neural_cbf_unsafe_weight),
+        )
+        if x_prev.shape[0] > 0:
+            pre_loss = _fit_neural_cbf(
+                env=env,
+                optimizer=neural_cbf_opt,
+                args=args,
+                x_prev_arr=x_prev,
+                x_next_arr=x_next,
+                safe_arr=safe_lbl,
+                weight_arr=sample_w,
+                epochs=max(1, int(args.pretrain_neural_cbf_epochs)),
+                rng=rng,
+            )
+            print(
+                f"Neural CBF pretrain | samples {x_prev.shape[0]} | "
+                f"epochs {int(args.pretrain_neural_cbf_epochs)} | loss {pre_loss:.4f}"
+            )
+            _sync_neural_runtime()
+            if args.neural_cbf_model:
+                env.neural_cbf.save(args.neural_cbf_model)
+        else:
+            print("Neural CBF pretrain requested, but no valid samples were collected.")
+
     if start_update > args.updates:
         print(
             f"Checkpoint update already reached target: start_update={start_update}, updates={args.updates}. Nothing to run."
         )
-        env.close()
+        _close_envs()
         return
 
     for update in range(start_update, args.updates + 1):
         update_start_t = time.time()
-        env.reset()
         rollout_obs = []
         rollout_global = []
         rollout_pos = []
@@ -559,109 +733,157 @@ def main() -> None:
         rollout_neural_x_next: List[np.ndarray] = []
         rollout_neural_safe: List[float] = []
         rollout_neural_weight: List[float] = []
-        prev_neural_by_robot: Dict[str, Tuple[np.ndarray, float]] = {}
+        prev_neural_by_env: List[Dict[str, Tuple[np.ndarray, float]]] = [dict() for _ in envs]
         neural_loss_value = 0.0
         episode_successes = 0
         episode_count = 0
-        prev_viol = dict(env.violations)
+        prev_viol_by_env: List[Dict[str, int]] = [dict(e.violations) for e in envs]
         steps = 0
-        episode_steps = 0
+        episode_steps: List[int] = [0 for _ in envs]
 
         while steps < args.steps_per_update:
-            obs, pos = build_observation(env)
-            global_state = build_global_state(env)
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-            pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
-            global_t = torch.tensor(global_state, dtype=torch.float32, device=device)
-            with torch.no_grad():
-                act_out = policy.act(obs_t, pos_t, deterministic=False)
-                value = critic(obs_t, global_t)
+            step_obs_env = []
+            step_global_env = []
+            step_pos_env = []
+            step_pre_env = []
+            step_grip_env = []
+            step_logp_env = []
+            step_vals_env = []
+            step_rewards_env = []
+            step_dones_env = []
 
-            actions = _to_actions(act_out.action.cpu().numpy(), env)
-            _obs, info = env.step(actions)
-            reward, prev_viol = _compute_reward(env, info, prev_viol, args)
-            done = float(info["phase"] == "done")
-            cbf = info.get("cbf", {})
-            rollout_cbf_calls += int(cbf.get("calls", 0))
-            rollout_cbf_modified += int(cbf.get("modified", 0))
-            rollout_cbf_fallback += int(cbf.get("fallback", 0))
-            rollout_cbf_force_stop += int(cbf.get("force_stop", 0))
-            rollout_int_l2 += float(cbf.get("intervention_l2", 0.0))
-            eps = max(float(args.cbf_epsilon), 1e-6)
-            rollout_cbf_prox += (max(0.0, eps - float(cbf.get("sep_barrier_norm_min", 1.0))) / eps) ** 2
-            rollout_cbf_prox += (max(0.0, eps - float(cbf.get("speed_barrier_norm_min", 1.0))) / eps) ** 2
-            rollout_cbf_prox += (max(0.0, eps - float(cbf.get("force_barrier_norm_min", 1.0))) / eps) ** 2
-            rollout_cbf_prox += (max(0.0, eps - float(np.tanh(float(cbf.get("neural_barrier_min", 1.0))))) / eps) ** 2
-            rollout_cbf_prox += (max(0.0, -float(cbf.get("neural_constraint_margin_min", 1.0))) / eps) ** 2
-            forces = np.array(info.get("contact_forces", []), dtype=np.float32)
-            if forces.size > 0:
-                rollout_force_balance += float(np.var(forces / max(env.cfg.contact_force_max, 1e-6)))
-                total_force = float(np.sum(np.maximum(forces, 0.0)))
-                if total_force > 1e-6 and len(env.robots) == int(forces.shape[0]):
-                    measured_share = np.maximum(forces, 0.0) / total_force
-                    payload = np.array([max(1e-6, float(robot.spec.payload)) for robot in env.robots], dtype=np.float32)
-                    target_share = payload / float(np.sum(payload))
-                    rollout_load_share += float(np.mean((measured_share - target_share) ** 2))
-            rollout_tilt += float(info.get("object_tilt_rad", 0.0))
-            rollout_belief_unc += float(info.get("belief", {}).get("uncertainty_pos", 0.0))
-            if neural_cbf_opt is not None:
-                for robot_name, robot_metrics in env.cbf_step_metrics.items():
-                    neural_input = robot_metrics.get("neural_input")
-                    h_curr = float(robot_metrics.get("neural_barrier", 0.0))
-                    prev_sample = prev_neural_by_robot.get(robot_name)
-                    if prev_sample is not None:
-                        prev_input, _h_prev = prev_sample
-                        force_safe = float(robot_metrics.get("force_barrier_raw", -1.0)) >= 0.0
-                        constraint_safe = float(robot_metrics.get("neural_constraint_margin", -1.0)) >= -1e-4
+            for env_idx, env_i in enumerate(envs):
+                obs, pos = build_observation(env_i)
+                global_state = build_global_state(env_i)
+                obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
+                pos_t = torch.tensor(pos, dtype=torch.float32, device=device)
+                global_t = torch.tensor(global_state, dtype=torch.float32, device=device)
+                with torch.no_grad():
+                    act_out = policy.act(obs_t, pos_t, deterministic=False)
+                    value = critic(obs_t, global_t)
+
+                actions = _to_actions(act_out.action.cpu().numpy(), env_i)
+                _obs, info = env_i.step(actions)
+                reward, prev_viol = _compute_reward(env_i, info, prev_viol_by_env[env_idx], args)
+                prev_viol_by_env[env_idx] = prev_viol
+                done = float(info["phase"] == "done")
+
+                cbf = info.get("cbf", {})
+                rollout_cbf_calls += int(cbf.get("calls", 0))
+                rollout_cbf_modified += int(cbf.get("modified", 0))
+                rollout_cbf_fallback += int(cbf.get("fallback", 0))
+                rollout_cbf_force_stop += int(cbf.get("force_stop", 0))
+                rollout_int_l2 += float(cbf.get("intervention_l2", 0.0))
+                eps = max(float(args.cbf_epsilon), 1e-6)
+                rollout_cbf_prox += (max(0.0, eps - float(cbf.get("sep_barrier_norm_min", 1.0))) / eps) ** 2
+                rollout_cbf_prox += (max(0.0, eps - float(cbf.get("speed_barrier_norm_min", 1.0))) / eps) ** 2
+                rollout_cbf_prox += (max(0.0, eps - float(cbf.get("force_barrier_norm_min", 1.0))) / eps) ** 2
+                rollout_cbf_prox += (
+                    max(0.0, eps - float(np.tanh(float(cbf.get("neural_barrier_min", 1.0)))) ) / eps
+                ) ** 2
+                rollout_cbf_prox += (max(0.0, -float(cbf.get("neural_constraint_margin_min", 1.0))) / eps) ** 2
+                forces = np.array(info.get("contact_forces", []), dtype=np.float32)
+                if forces.size > 0:
+                    rollout_force_balance += float(np.var(forces / max(env_i.cfg.contact_force_max, 1e-6)))
+                    total_force = float(np.sum(np.maximum(forces, 0.0)))
+                    if total_force > 1e-6 and len(env_i.robots) == int(forces.shape[0]):
+                        measured_share = np.maximum(forces, 0.0) / total_force
+                        payload = np.array(
+                            [max(1e-6, float(robot.spec.payload)) for robot in env_i.robots],
+                            dtype=np.float32,
+                        )
+                        target_share = payload / float(np.sum(payload))
+                        rollout_load_share += float(np.mean((measured_share - target_share) ** 2))
+                rollout_tilt += float(info.get("object_tilt_rad", 0.0))
+                rollout_belief_unc += float(info.get("belief", {}).get("uncertainty_pos", 0.0))
+                if neural_cbf_opt is not None:
+                    prev_neural = prev_neural_by_env[env_idx]
+                    for robot_name, robot_metrics in env_i.cbf_step_metrics.items():
+                        neural_input = robot_metrics.get("neural_input")
+                        h_curr = float(robot_metrics.get("neural_barrier", 0.0))
+                        prev_sample = prev_neural.get(robot_name)
+                        if prev_sample is not None:
+                            prev_input, _h_prev = prev_sample
+                            force_safe = float(robot_metrics.get("force_barrier_raw", -1.0)) >= 0.0
+                            constraint_safe = float(robot_metrics.get("neural_constraint_margin", -1.0)) >= -1e-4
+                            if neural_input is not None:
+                                safe_label = 1.0 if (force_safe and constraint_safe) else 0.0
+                                sample_weight = 1.0 if safe_label >= 0.5 else float(args.neural_cbf_unsafe_weight)
+                                rollout_neural_x_prev.append(prev_input.astype(np.float32))
+                                rollout_neural_x_next.append(np.asarray(neural_input, dtype=np.float32))
+                                rollout_neural_safe.append(float(safe_label))
+                                rollout_neural_weight.append(float(sample_weight))
                         if neural_input is not None:
-                            safe_label = 1.0 if (force_safe and constraint_safe) else 0.0
-                            sample_weight = 1.0 if safe_label >= 0.5 else float(args.neural_cbf_unsafe_weight)
-                            rollout_neural_x_prev.append(prev_input.astype(np.float32))
-                            rollout_neural_x_next.append(np.asarray(neural_input, dtype=np.float32))
-                            rollout_neural_safe.append(float(safe_label))
-                            rollout_neural_weight.append(float(sample_weight))
-                    if neural_input is not None:
-                        prev_neural_by_robot[robot_name] = (np.asarray(neural_input, dtype=np.float32), h_curr)
-                    else:
-                        prev_neural_by_robot.pop(robot_name, None)
+                            prev_neural[robot_name] = (np.asarray(neural_input, dtype=np.float32), h_curr)
+                        else:
+                            prev_neural.pop(robot_name, None)
 
-            rollout_obs.append(obs)
-            rollout_global.append(global_state)
-            rollout_pos.append(pos)
-            rollout_pre.append(act_out.pre_tanh.cpu().numpy())
-            rollout_grip.append(act_out.grip_action.cpu().numpy())
-            rollout_logp.append(act_out.logprob.cpu().numpy())
-            rollout_vals.append(float(value.cpu().item()))
-            rollout_rewards.append(reward)
-            rollout_dones.append(done)
+                step_obs_env.append(obs)
+                step_global_env.append(global_state)
+                step_pos_env.append(pos)
+                step_pre_env.append(act_out.pre_tanh.cpu().numpy())
+                step_grip_env.append(act_out.grip_action.cpu().numpy())
+                step_logp_env.append(act_out.logprob.cpu().numpy())
+                step_vals_env.append(float(value.cpu().item()))
+                step_rewards_env.append(float(reward))
+                step_dones_env.append(float(done))
 
+                episode_steps[env_idx] += 1
+                if done or episode_steps[env_idx] >= args.max_steps:
+                    episode_count += 1
+                    if done:
+                        episode_successes += 1
+                    env_i.reset()
+                    prev_viol_by_env[env_idx] = dict(env_i.violations)
+                    prev_neural_by_env[env_idx].clear()
+                    episode_steps[env_idx] = 0
+
+            rollout_obs.append(np.stack(step_obs_env, axis=0))
+            rollout_global.append(np.stack(step_global_env, axis=0))
+            rollout_pos.append(np.stack(step_pos_env, axis=0))
+            rollout_pre.append(np.stack(step_pre_env, axis=0))
+            rollout_grip.append(np.stack(step_grip_env, axis=0))
+            rollout_logp.append(np.stack(step_logp_env, axis=0))
+            rollout_vals.append(np.asarray(step_vals_env, dtype=np.float32))
+            rollout_rewards.append(np.asarray(step_rewards_env, dtype=np.float32))
+            rollout_dones.append(np.asarray(step_dones_env, dtype=np.float32))
             steps += 1
-            episode_steps += 1
-            if done or episode_steps >= args.max_steps:
-                episode_count += 1
-                if done:
-                    episode_successes += 1
-                env.reset()
-                prev_viol = dict(env.violations)
-                prev_neural_by_robot.clear()
-                episode_steps = 0
 
-        advantages, returns = _compute_gae(
-            np.array(rollout_rewards, dtype=np.float32),
-            np.array(rollout_vals, dtype=np.float32),
-            np.array(rollout_dones, dtype=np.float32),
-            args.gamma,
-            args.gae_lambda,
-        )
+        rewards_arr = np.stack(rollout_rewards, axis=0)  # (T, E)
+        vals_arr = np.stack(rollout_vals, axis=0)  # (T, E)
+        dones_arr = np.stack(rollout_dones, axis=0)  # (T, E)
+        advantages = np.zeros_like(rewards_arr, dtype=np.float32)
+        returns = np.zeros_like(rewards_arr, dtype=np.float32)
+        for env_idx in range(rewards_arr.shape[1]):
+            adv_e, ret_e = _compute_gae(
+                rewards_arr[:, env_idx],
+                vals_arr[:, env_idx],
+                dones_arr[:, env_idx],
+                args.gamma,
+                args.gae_lambda,
+            )
+            advantages[:, env_idx] = adv_e
+            returns[:, env_idx] = ret_e
+
         cbf_rate = rollout_cbf_modified / max(rollout_cbf_calls, 1)
         success_rate = float(episode_successes / max(episode_count, 1))
 
-        obs_arr = np.stack(rollout_obs)  # (T, N, obs_dim)
-        global_arr = np.stack(rollout_global)  # (T, G)
-        pos_arr = np.stack(rollout_pos)
-        pre_arr = np.stack(rollout_pre)
-        grip_arr = np.stack(rollout_grip)
-        old_logp = np.stack(rollout_logp)
+        obs_arr = np.stack(rollout_obs, axis=0)  # (T, E, N, D)
+        global_arr = np.stack(rollout_global, axis=0)  # (T, E, G)
+        pos_arr = np.stack(rollout_pos, axis=0)  # (T, E, N, 2)
+        pre_arr = np.stack(rollout_pre, axis=0)  # (T, E, N, 3)
+        grip_arr = np.stack(rollout_grip, axis=0)  # (T, E, N)
+        old_logp = np.stack(rollout_logp, axis=0)  # (T, E, N)
+
+        T, E = obs_arr.shape[0], obs_arr.shape[1]
+        obs_arr = obs_arr.reshape(T * E, *obs_arr.shape[2:])
+        global_arr = global_arr.reshape(T * E, global_arr.shape[2])
+        pos_arr = pos_arr.reshape(T * E, *pos_arr.shape[2:])
+        pre_arr = pre_arr.reshape(T * E, *pre_arr.shape[2:])
+        grip_arr = grip_arr.reshape(T * E, grip_arr.shape[2])
+        old_logp = old_logp.reshape(T * E, old_logp.shape[2])
+        advantages = advantages.reshape(T * E)
+        returns = returns.reshape(T * E)
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-6)
         returns_t = torch.tensor(returns, dtype=torch.float32, device=device)
@@ -715,36 +937,18 @@ def main() -> None:
             x_next_arr = np.stack(rollout_neural_x_next).astype(np.float32)
             safe_arr = np.array(rollout_neural_safe, dtype=np.float32)
             weight_arr = np.array(rollout_neural_weight, dtype=np.float32)
-            idx = np.arange(x_prev_arr.shape[0])
-            model = env.neural_cbf.model
-            model.train()
-            loss_acc = 0.0
-            loss_count = 0
-            for _ in range(max(1, args.neural_cbf_epochs)):
-                rng.shuffle(idx)
-                for start in range(0, len(idx), args.minibatch):
-                    batch_idx = idx[start : start + args.minibatch]
-                    batch_x_prev = torch.tensor(x_prev_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
-                    batch_x_next = torch.tensor(x_next_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
-                    batch_safe = torch.tensor(safe_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
-                    batch_w = torch.tensor(weight_arr[batch_idx], dtype=torch.float32, device=env.neural_cbf.device)
-                    h_prev = model(batch_x_prev)
-                    h_next = model(batch_x_next)
-                    residual = h_next - h_prev + float(args.neural_cbf_train_alpha * env.control_dt) * h_prev
-                    residual_loss = torch.relu(float(args.neural_cbf_margin) - residual).pow(2)
-                    safe_pen = torch.relu(0.1 - h_next).pow(2)
-                    unsafe_pen = torch.relu(h_next + 0.1).pow(2)
-                    cls_pen = batch_safe * safe_pen + (1.0 - batch_safe) * unsafe_pen
-                    # Weight unsafe transitions more heavily to avoid safe-only bias.
-                    loss = (batch_w * (residual_loss + float(args.neural_cbf_cls_lambda) * cls_pen)).mean()
-                    neural_cbf_opt.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    neural_cbf_opt.step()
-                    loss_acc += float(loss.item())
-                    loss_count += 1
-            model.eval()
-            neural_loss_value = loss_acc / max(loss_count, 1)
+            neural_loss_value = _fit_neural_cbf(
+                env=env,
+                optimizer=neural_cbf_opt,
+                args=args,
+                x_prev_arr=x_prev_arr,
+                x_next_arr=x_next_arr,
+                safe_arr=safe_arr,
+                weight_arr=weight_arr,
+                epochs=max(1, int(args.neural_cbf_epochs)),
+                rng=rng,
+            )
+            _sync_neural_runtime()
             if args.neural_cbf_model:
                 env.neural_cbf.save(args.neural_cbf_model)
 
@@ -794,6 +998,7 @@ def main() -> None:
                 if args.verify_checkpoints:
                     _verify_checkpoint(checkpoint_path, update)
 
+        transitions = float(max(1, steps * len(envs)))
         logger.write(
             {
                 "update": update,
@@ -808,12 +1013,12 @@ def main() -> None:
                 "cbf_fallback": float(rollout_cbf_fallback),
                 "cbf_force_stop": float(rollout_cbf_force_stop),
                 "cbf_rate": float(cbf_rate),
-                "cbf_intervention_l2": float(rollout_int_l2 / max(steps, 1)),
-                "cbf_proximity": float(rollout_cbf_prox / max(steps, 1)),
-                "force_balance_var": float(rollout_force_balance / max(steps, 1)),
-                "load_share_mse": float(rollout_load_share / max(steps, 1)),
-                "object_tilt_mean": float(rollout_tilt / max(steps, 1)),
-                "belief_uncertainty_mean": float(rollout_belief_unc / max(steps, 1)),
+                "cbf_intervention_l2": float(rollout_int_l2 / transitions),
+                "cbf_proximity": float(rollout_cbf_prox / transitions),
+                "force_balance_var": float(rollout_force_balance / transitions),
+                "load_share_mse": float(rollout_load_share / transitions),
+                "object_tilt_mean": float(rollout_tilt / transitions),
+                "belief_uncertainty_mean": float(rollout_belief_unc / transitions),
                 "neural_cbf_loss": float(neural_loss_value),
                 "update_sec": float(time.time() - update_start_t),
             }
@@ -824,11 +1029,11 @@ def main() -> None:
                 f"Update {update}/{args.updates} | mean reward {np.mean(rollout_rewards):.3f} | "
                 f"value loss {value_loss.item():.4f} | actor loss {actor_loss.item():.4f} | "
                 f"cbf rate {cbf_rate:.3f} | neural cbf loss {neural_loss_value:.4f} | "
-                f"belief unc {rollout_belief_unc / max(steps, 1):.4f} | "
+                f"belief unc {rollout_belief_unc / transitions:.4f} | "
                 f"{time.time() - update_start_t:.2f}s/update"
             )
 
-    env.close()
+    _close_envs()
 
 
 if __name__ == "__main__":

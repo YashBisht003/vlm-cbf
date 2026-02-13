@@ -18,8 +18,9 @@ from vlm_llava_utils import parse_output_json
 
 
 DEFAULT_PROMPT = (
-    "Given the object geometry and dimensions, output 4 robot waypoints in the object frame. "
-    "Return strict JSON with fields: confidence, waypoints[{x,y,load}]."
+    "Given the object geometry and dimensions, output K=3 ranked formation hypotheses in object frame. "
+    "Return strict JSON: hypotheses[{confidence,waypoints[{x,y,load}],load_fractions[4]}], "
+    "plus top-level confidence and waypoints for the best hypothesis."
 )
 
 
@@ -86,7 +87,7 @@ def infer_with_loaded(
     text_out = processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
     parsed = parse_output_json(text_out)
     if parsed is None:
-        parsed = {"confidence": 0.0, "waypoints": [], "raw_text": text_out}
+        parsed = {"confidence": 0.0, "waypoints": [], "hypotheses": [], "raw_text": text_out}
     else:
         parsed["raw_text"] = text_out
     return parsed

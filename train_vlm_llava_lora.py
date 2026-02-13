@@ -95,8 +95,9 @@ class LlavaFormationDataset(Dataset):
         prompt, answer = parse_training_record(sample)
         if not prompt:
             prompt = (
-                "Given the object geometry and dimensions, output 4 robot waypoints in the object frame. "
-                "Return JSON with fields: waypoints[{x,y,load}], confidence."
+                "Given the object geometry and dimensions, output K=3 ranked formation hypotheses in object frame. "
+                "Return strict JSON: hypotheses[{confidence,waypoints[{x,y,load}],load_fractions[4]}], "
+                "plus top-level confidence and waypoints for the best hypothesis."
             )
         return {"image": image, "prompt": prompt, "answer": answer}
 

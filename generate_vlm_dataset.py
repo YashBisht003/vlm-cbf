@@ -178,8 +178,9 @@ def main() -> None:
     )
     env = VlmCbfEnv(cfg)
     prompt = (
-        "Given the object geometry and dimensions, output 4 robot waypoints in the object frame. "
-        "Return JSON with fields: waypoints[{x,y,load}], confidence."
+        "Given the object geometry and dimensions, output K=3 ranked formation hypotheses in object frame. "
+        "Return strict JSON: hypotheses[{confidence,waypoints[{x,y,load}],load_fractions[4]}], "
+        "plus top-level confidence and waypoints for the best hypothesis."
     )
 
     try:
@@ -210,12 +211,28 @@ def main() -> None:
                     )
 
                 dims = env.object_spec.dims
-                waypoints, labels = env._geometric_fallback(dims)
+                hypotheses = env._default_hypotheses(dims)
+                best_h = hypotheses[0]
+                waypoints = best_h.waypoints_local
+                labels = best_h.load_labels
+                hyp_json = []
+                for hyp in hypotheses:
+                    hyp_json.append(
+                        {
+                            "confidence": float(hyp.confidence),
+                            "waypoints": [
+                                {"x": float(x), "y": float(y), "load": str(hyp.load_labels[i])}
+                                for i, (x, y) in enumerate(hyp.waypoints_local)
+                            ],
+                            "load_fractions": [float(v) for v in hyp.load_fractions],
+                        }
+                    )
                 base_output = {
-                    "confidence": 1.0,
+                    "confidence": float(best_h.confidence),
                     "waypoints": [
                         {"x": float(x), "y": float(y), "load": labels[i]} for i, (x, y) in enumerate(waypoints)
                     ],
+                    "hypotheses": hyp_json,
                     "dimensions": {"length": dims[0], "width": dims[1], "height": dims[2]},
                     "shape": env.object_spec.shape,
                 }

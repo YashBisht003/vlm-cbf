@@ -7,6 +7,7 @@ VLM-CBF cooperative manipulation spec:
 - Phase-based coordination (Observe -> Plan -> Approach -> FineApproach -> Contact -> Probe -> Correct -> Lift -> Transport -> Place)
 - Conflict-free task allocation (Hungarian)
 - Safety monitors (speed, separation, contact force)
+- Contact timeout handling: retry, widened geometric fallback, and optional degraded mode when one agile robot misses contact
 
 The environment is intentionally modular so you can plug in your own VLM,
 GNN, and CBF implementations. The default runner includes simple heuristic
@@ -140,9 +141,21 @@ It can run on CPU, but will be much faster on a GPU.
 The critic input includes:
 - concatenated per-agent observations
 - explicit global state (`object pose`, `goal`, `phase`, `belief mean/cov`, force stats)
+- per-agent observation uses the paper-style 101D structure
+  (`ego`, `object-relative`, `forces`, `goal`, `neighbors`, `belief`, `safety`, `phase`)
 
 ```powershell
 & "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --steps-per-update 512 --out mappo_policy.pt --checkpoint-dir checkpoints --save-every 25 --save-latest --log-interval 10
+```
+
+Parallel rollout collection (recommended on multi-core CPU/GPU nodes):
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --num-envs 8 --updates 1600 --steps-per-update 512 --checkpoint-dir checkpoints
+```
+
+Optional neural-CBF pretrain warm start (recommended):
+```powershell
+& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --steps-per-update 512 --train-neural-cbf --pretrain-neural-cbf-steps 20000 --pretrain-neural-cbf-epochs 3 --checkpoint-dir checkpoints
 ```
 
 Resume from latest checkpoint:
@@ -241,6 +254,10 @@ Neural force barrier integration (`h_phi([F_i, mu_b, Sigma_b])`):
 - A linearized neural-CBF inequality is added to the same QP (`a^T v + s >= b`) using autograd `dh_phi/dv` at the current control point.
 - By default, extra neural speed/separation shaping is disabled (`neural_cbf_tighten_gain=0`, `neural_cbf_sigmoid_gain=0`) so the neural term enters primarily through the QP inequality.
 - Online neural-CBF training uses temporal rollout residuals plus safe/unsafe sign regularization, including unsafe transitions.
+
+Belief EKF state (paper-aligned):
+- `x_obj = [m, p_COM(x,y,z), I_diag(xx,yy,zz)]`
+- belief covariance is used for risk-adaptive CBF tightening.
 
 ## Distributed Phase + UDP
 Phase synchronization supports a UDP peer-broadcast mode:

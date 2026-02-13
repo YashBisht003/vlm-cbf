@@ -84,15 +84,43 @@ def parse_waypoints(output: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     return parsed[:4]
 
 
+def parse_hypotheses(output: Dict[str, Any], k: int = 3) -> Optional[List[Dict[str, Any]]]:
+    """
+    Parse multi-hypothesis format:
+      {"hypotheses":[{"confidence":c,"waypoints":[...]} ...]}
+    Falls back to single-hypothesis format if "hypotheses" is missing.
+    """
+    hyps = output.get("hypotheses", None)
+    parsed: List[Dict[str, Any]] = []
+    if isinstance(hyps, list) and hyps:
+        for entry in hyps[: max(1, int(k))]:
+            if not isinstance(entry, dict):
+                continue
+            wps = parse_waypoints(entry)
+            if wps is None:
+                continue
+            conf = float(entry.get("confidence", output.get("confidence", 0.0)))
+            parsed.append({"confidence": conf, "waypoints": wps})
+        if parsed:
+            parsed.sort(key=lambda h: float(h.get("confidence", 0.0)), reverse=True)
+            return parsed
+
+    wps = parse_waypoints(output)
+    if wps is None:
+        return None
+    conf = float(output.get("confidence", 0.0))
+    return [{"confidence": conf, "waypoints": wps}]
+
+
 def extract_ground_truth(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     prompt, answer = parse_training_record(sample)
     _ = prompt  # prompt is not needed for metric extraction
     obj = parse_output_json(answer)
     if obj is None:
         return None
-    waypoints = parse_waypoints(obj)
-    if waypoints is None:
+    hypotheses = parse_hypotheses(obj, k=3)
+    if hypotheses is None:
         return None
-    confidence = float(obj.get("confidence", 1.0))
-    return {"confidence": confidence, "waypoints": waypoints}
-
+    top = hypotheses[0]
+    confidence = float(top.get("confidence", obj.get("confidence", 1.0)))
+    return {"confidence": confidence, "waypoints": top["waypoints"], "hypotheses": hypotheses}

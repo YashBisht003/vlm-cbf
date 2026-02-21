@@ -10,7 +10,7 @@ from vlm_cbf_env import Phase, VlmCbfEnv
 
 PHASE_BINS: List[List[str]] = [
     [Phase.OBSERVE.value, Phase.PLAN.value, Phase.APPROACH.value, Phase.FINE_APPROACH.value],
-    [Phase.CONTACT.value, Phase.PROBE.value, Phase.CORRECT.value],
+    [Phase.CONTACT.value, Phase.PROBE.value, Phase.CORRECT.value, Phase.REGRIP.value],
     [Phase.LIFT.value, Phase.TRANSPORT.value],
     [Phase.PLACE.value, Phase.DONE.value],
 ]
@@ -28,6 +28,7 @@ def _phase_one_hot4(phase: str) -> np.ndarray:
 
 def _pad_or_trim(values: np.ndarray, size: int) -> np.ndarray:
     arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    arr = np.nan_to_num(arr, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
     if arr.shape[0] >= size:
         return arr[:size]
     out = np.zeros(size, dtype=np.float32)
@@ -208,6 +209,8 @@ def _cbf_team_features(env: VlmCbfEnv) -> np.ndarray:
 def _phase_one_hot_legacy(phase: str) -> np.ndarray:
     # Kept for compatibility in older analysis scripts.
     vec = np.zeros(11, dtype=np.float32)
+    if phase == Phase.REGRIP.value:
+        phase = Phase.CORRECT.value
     names = [
         Phase.OBSERVE.value,
         Phase.PLAN.value,
@@ -286,9 +289,14 @@ def build_observation(env: VlmCbfEnv) -> Tuple[np.ndarray, np.ndarray]:
 
         safety5 = _safety_features(env, robot.spec.name)
         obs = np.concatenate([ego20, obj_rel12, force6, goal6, neighbors36, belief12, safety5, phase_vec], axis=0)
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
         obs_list.append(obs)
 
-    return np.stack(obs_list, axis=0), np.stack(pos_list, axis=0)
+    obs_arr = np.stack(obs_list, axis=0).astype(np.float32)
+    pos_arr = np.stack(pos_list, axis=0).astype(np.float32)
+    obs_arr = np.nan_to_num(obs_arr, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
+    pos_arr = np.nan_to_num(pos_arr, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
+    return obs_arr, pos_arr
 
 
 def obs_dim() -> int:
@@ -324,6 +332,7 @@ def build_global_state(env: VlmCbfEnv) -> np.ndarray:
     robots36 = np.concatenate(robot_blocks, axis=0).astype(np.float32)
     cbf5 = _cbf_team_features(env)
     global_state = np.concatenate([obj12, goal, phase4, belief12, robots36, cbf5], axis=0).astype(np.float32)
+    global_state = np.nan_to_num(global_state, nan=0.0, posinf=1e3, neginf=-1e3).astype(np.float32)
     return global_state
 
 

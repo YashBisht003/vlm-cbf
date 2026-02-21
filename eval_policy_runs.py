@@ -33,6 +33,33 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable probe-and-correct phases (Contact -> Lift directly)",
     )
+    parser.add_argument(
+        "--regrip",
+        dest="regrip_enabled",
+        action="store_true",
+        help="Enable explicit sequential regrip phase (default: enabled)",
+    )
+    parser.add_argument(
+        "--no-regrip",
+        dest="regrip_enabled",
+        action="store_false",
+        help="Disable explicit sequential regrip phase",
+    )
+    parser.add_argument("--regrip-max-robots", type=int, default=1, help="Max robots to regrip per cycle")
+    parser.add_argument(
+        "--regrip-share-error-thresh",
+        type=float,
+        default=0.08,
+        help="Min absolute load-share error needed to schedule regrip",
+    )
+    parser.add_argument("--regrip-attach-hold-s", type=float, default=0.20, help="Hold time after reattach (s)")
+    parser.add_argument("--regrip-timeout-s", type=float, default=6.0, help="Regrip phase timeout (s)")
+    parser.add_argument(
+        "--regrip-min-attached-guard",
+        type=int,
+        default=3,
+        help="Minimum non-selected robots that must stay attached during release",
+    )
     parser.add_argument("--residual-model", default="", help="Path to learned residual correction model")
     parser.add_argument(
         "--no-learned-residual",
@@ -97,6 +124,7 @@ def _parse_args() -> argparse.Namespace:
         default=1.05,
         help="Required force margin multiplier vs object weight",
     )
+    parser.set_defaults(regrip_enabled=True)
     return parser.parse_args()
 
 
@@ -216,6 +244,12 @@ def main() -> None:
         residual_model_path=(args.residual_model if args.residual_model else None),
         probe_use_learned_residual=not args.no_learned_residual,
         enable_probe_correct=not args.no_probe_correct,
+        regrip_enabled=bool(args.regrip_enabled),
+        regrip_max_robots=max(0, int(args.regrip_max_robots)),
+        regrip_share_error_thresh=max(0.0, float(args.regrip_share_error_thresh)),
+        regrip_attach_hold_s=max(0.0, float(args.regrip_attach_hold_s)),
+        regrip_timeout_s=max(0.0, float(args.regrip_timeout_s)),
+        regrip_min_attached_guard=max(0, int(args.regrip_min_attached_guard)),
     )
     env = VlmCbfEnv(cfg)
     results = []

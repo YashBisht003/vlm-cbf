@@ -21,6 +21,10 @@ class BeliefEKF:
         self.x = np.zeros(7, dtype=np.float32)
         self.P = np.diag([225.0, 0.02, 0.02, 0.02, 5.0, 5.0, 5.0]).astype(np.float32)
         self._g = 9.81
+        self._state_min = np.array([1.0, -2.0, -2.0, -2.0, 1e-4, 1e-4, 1e-4], dtype=np.float32)
+        self._state_max = np.array([500.0, 2.0, 2.0, 2.0, 1e6, 1e6, 1e6], dtype=np.float32)
+        self._var_min = np.array([1e-6, 1e-6, 1e-6, 1e-6, 1e-4, 1e-4, 1e-4], dtype=np.float32)
+        self._var_max = np.array([1e6, 1.0, 1.0, 1.0, 1e8, 1e8, 1e8], dtype=np.float32)
 
     def initialize(
         self,
@@ -71,7 +75,7 @@ class BeliefEKF:
             ]
         ).astype(np.float32)
         self.P = (self.P + Q).astype(np.float32)
-        self.P = (0.5 * (self.P + self.P.T)).astype(np.float32)
+        self._stabilize()
 
     def _measurement_model(
         self,
@@ -116,6 +120,26 @@ class BeliefEKF:
             H[:, i] = ((z1 - z2) / max(1e-6, 2.0 * eps)).astype(np.float32)
         return H
 
+    def _stabilize(self) -> None:
+        # Keep state and covariance finite and bounded.
+        self.x = np.nan_to_num(self.x, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
+        self.x = np.clip(self.x, self._state_min, self._state_max).astype(np.float32)
+        self.x[0] = max(1.0, float(self.x[0]))
+
+        P = np.nan_to_num(self.P, nan=0.0, posinf=1e9, neginf=-1e9).astype(np.float32)
+        P = (0.5 * (P + P.T)).astype(np.float32)
+        d = np.diag(P).astype(np.float32)
+        d = np.clip(d, self._var_min, self._var_max)
+        np.fill_diagonal(P, d)
+        # Project to PSD to avoid negative variances from numerical drift.
+        try:
+            w, v = np.linalg.eigh(P.astype(np.float64))
+            w = np.clip(w, 1e-9, 1e12)
+            P = (v @ np.diag(w) @ v.T).astype(np.float32)
+        except np.linalg.LinAlgError:
+            P = np.diag(d).astype(np.float32)
+        self.P = (0.5 * (P + P.T)).astype(np.float32)
+
     def update(
         self,
         forces_z: Sequence[float] | Tuple[float, float, float],
@@ -138,6 +162,7 @@ class BeliefEKF:
         if robot_xy.shape[0] != z_forces.shape[0]:
             return
 
+        self._stabilize()
         h = self._measurement_model(self.x, robot_xy, obj_xy)
         H = self._jacobian_numeric(self.x, robot_xy, obj_xy)
 
@@ -147,15 +172,24 @@ class BeliefEKF:
 
         y = (z - h).astype(np.float32)
         S = H @ self.P @ H.T + R
+        if not np.all(np.isfinite(S)):
+            self._stabilize()
+            return
         try:
             K = self.P @ H.T @ np.linalg.inv(S)
         except np.linalg.LinAlgError:
             K = self.P @ H.T @ np.linalg.pinv(S)
 
+        if not np.all(np.isfinite(K)):
+            self._stabilize()
+            return
+
         self.x = (self.x + K @ y).astype(np.float32)
-        self.x[0] = max(1.0, float(self.x[0]))
-        self.P = (np.eye(7, dtype=np.float32) - K @ H) @ self.P
-        self.P = (0.5 * (self.P + self.P.T)).astype(np.float32)
+        I = np.eye(7, dtype=np.float32)
+        KH = K @ H
+        # Joseph form is numerically more stable than (I-KH)P.
+        self.P = (I - KH) @ self.P @ (I - KH).T + K @ R @ K.T
+        self._stabilize()
 
     def mean(self) -> np.ndarray:
         return self.x.copy()

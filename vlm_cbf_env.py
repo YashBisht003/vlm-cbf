@@ -6,8 +6,8 @@ from typing import Dict, List, Optional, Tuple
 
 import json
 import math
+import os
 import statistics
-from pathlib import Path
 import time
 
 import numpy as np
@@ -41,6 +41,7 @@ class Phase(Enum):
     CONTACT = "contact"
     PROBE = "probe"
     CORRECT = "correct"
+    REGRIP = "regrip"
     LIFT = "lift"
     TRANSPORT = "transport"
     PLACE = "place"
@@ -75,10 +76,12 @@ class TaskConfig:
     use_ik: bool = True
     kinematic_base: bool = False
     carry_mode: str = "auto"  # auto, constraint, or kinematic
+    allow_kinematic_fallback: bool = True
     constraint_fallback_time: float = 2.0
     constraint_force_scale: float = 1.5
     vacuum_attach_dist: float = 0.18
     vacuum_break_dist: float = 0.30
+    vacuum_reattach_cooldown_s: float = 0.15
     vacuum_force_margin: float = 1.05
 
     yaw_rate_max: float = 1.2
@@ -97,6 +100,7 @@ class TaskConfig:
     cbf_risk_scale: float = 1.0
     cbf_slack_weight: float = 100.0
     cbf_slack_max: float = 3.0
+    cbf_intervention_thresh_l2: float = 1e-3
     cbf_risk_s_speed: float = 1.0
     cbf_risk_s_sep: float = 1.0
     cbf_risk_s_force: float = 1.0
@@ -135,6 +139,7 @@ class TaskConfig:
     phase_allow_quorum_fallback: bool = False
     phase_contact_force_threshold: float = 5.0
     phase_contact_timeout_s: float = 5.0
+    phase_contact_attach_hold_s: float = 0.25
     phase_correct_settle_dist: float = 0.08
     phase_correct_settle_s: float = 0.25
     phase_lift_stability_s: float = 1.0
@@ -157,6 +162,12 @@ class TaskConfig:
     residual_model_path: Optional[str] = None
     probe_use_learned_residual: bool = True
     enable_probe_correct: bool = True
+    regrip_enabled: bool = True
+    regrip_max_robots: int = 1
+    regrip_share_error_thresh: float = 0.08
+    regrip_attach_hold_s: float = 0.20
+    regrip_timeout_s: float = 6.0
+    regrip_min_attached_guard: int = 3
     contact_retry_limit: int = 2
     contact_waypoint_perturb_sigma: float = 0.05
     contact_fallback_spacing_scale: float = 1.25
@@ -214,6 +225,7 @@ class RobotInstance:
     base_constraint_id: Optional[int] = None
     grip_active: bool = False
     constraint_id: Optional[int] = None
+    reattach_allowed_at: float = 0.0
     waypoint: Optional[np.ndarray] = None
     waypoint_offset: Optional[np.ndarray] = None
 
@@ -352,6 +364,11 @@ class VlmCbfEnv:
         self.probe_ground_unloading: float = 0.0
         self.correct_started_at: Optional[float] = None
         self.probe_residual_mode: str = "heuristic"
+        self.contact_all_attached_since: Optional[float] = None
+        self.regrip_order: List[str] = []
+        self.regrip_idx: int = 0
+        self.regrip_stage: str = "release"
+        self.regrip_attach_hold_since: Optional[float] = None
 
     def reset(self) -> Dict:
         p.resetSimulation(physicsClientId=self.client_id)
@@ -438,13 +455,36 @@ class VlmCbfEnv:
             if self.phase_sync_delays_ms
             else 0.0
         )
+        attached_required = sum(
+            1 for robot in self.robots if robot.spec.name not in self.inactive_robot_names
+        )
+        attached_count = sum(
+            1
+            for robot in self.robots
+            if robot.spec.name not in self.inactive_robot_names and robot.constraint_id is not None
+        )
+        attach_hold_elapsed = (
+            0.0
+            if self.contact_all_attached_since is None
+            else max(0.0, self.sim_time - self.contact_all_attached_since)
+        )
         info = {
             "phase": self.phase.value,
             "time": self.sim_time,
             "violations": dict(self.violations),
             "carry_mode": self.active_carry_mode,
             "cbf": {**dict(self.cbf_stats), **dict(self.cbf_last_summary)},
-            "grasp": dict(self.grasp_stats),
+            "grasp": {
+                **dict(self.grasp_stats),
+                "attached_count": int(attached_count),
+                "attached_required": int(attached_required),
+                "attached_ratio": float(attached_count / max(1, attached_required)),
+                "attach_hold_elapsed_s": float(attach_hold_elapsed),
+                "attach_hold_target_s": float(self.cfg.phase_contact_attach_hold_s),
+                "regrip_stage": str(self.regrip_stage),
+                "regrip_index": int(self.regrip_idx),
+                "regrip_planned": int(len(self.regrip_order)),
+            },
             "contact_forces": contact_forces,
             "object_tilt_rad": tilt,
             "belief": {
@@ -570,13 +610,14 @@ class VlmCbfEnv:
         ]
 
     def _base_urdf_path(self, base_type: str) -> str:
+        assets_dir = os.path.join(os.path.dirname(__file__), "assets")
         if base_type == "omni":
             if self.cfg.base_omni_urdf:
                 return self.cfg.base_omni_urdf
-            return str(Path(__file__).parent / "assets" / "base_omni.urdf")
+            return os.path.join(assets_dir, "base_omni.urdf")
         if self.cfg.base_diff_urdf:
             return self.cfg.base_diff_urdf
-        return str(Path(__file__).parent / "assets" / "base_diff.urdf")
+        return os.path.join(assets_dir, "base_diff.urdf")
 
     def _wheel_joint_indices(self, base_id: int, base_type: str) -> List[int]:
         if base_type == "omni":
@@ -958,6 +999,9 @@ class VlmCbfEnv:
             elif self.phase == Phase.CORRECT:
                 target = robot.waypoint if robot.waypoint is not None else base_pos
                 grip = True
+            elif self.phase == Phase.REGRIP:
+                target = robot.waypoint if robot.waypoint is not None else base_pos
+                grip = True
             elif self.phase == Phase.LIFT:
                 target = base_pos
                 grip = True
@@ -1069,8 +1113,8 @@ class VlmCbfEnv:
             return np.linalg.norm(np.array(pos)[:2] - robot.waypoint[:2]) < self.cfg.phase_fine_approach_dist
 
         if self.phase == Phase.CONTACT:
-            if robot.constraint_id is not None:
-                return True
+            if self.active_carry_mode == "constraint":
+                return robot.constraint_id is not None
             return self._contact_force(robot) >= self.cfg.phase_contact_force_threshold
 
         if self.phase == Phase.PROBE:
@@ -1087,6 +1131,9 @@ class VlmCbfEnv:
             if self.correct_started_at is None:
                 self.correct_started_at = self.sim_time
             return (self.sim_time - self.correct_started_at) >= self.cfg.phase_correct_settle_s
+
+        if self.phase == Phase.REGRIP:
+            return self._all_constraints_attached()
 
         if self.phase == Phase.LIFT:
             obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
@@ -1394,7 +1441,7 @@ class VlmCbfEnv:
         eta_neural = self._risk_factor(self.cfg.cbf_risk_s_neural, com_unc + mass_rel_unc + 0.2 * inertia_unc)
 
         v_max = self.cfg.speed_limit / max(eta_speed, 1e-3)
-        if self.phase in (Phase.FINE_APPROACH, Phase.CONTACT, Phase.PROBE):
+        if self.phase in (Phase.FINE_APPROACH, Phase.CONTACT, Phase.PROBE, Phase.REGRIP):
             v_max = min(v_max, self.cfg.phase_fine_approach_speed_limit)
         d_min = self.cfg.separation_min * self.cfg.cbf_risk_scale * eta_sep
         alpha_eff = self.cfg.cbf_alpha / max(eta_sep, 1e-3)
@@ -1522,7 +1569,7 @@ class VlmCbfEnv:
             self.cbf_stats["force_stop"] += 1
 
         intervention_l2 = float(np.linalg.norm(v_safe - v_des) ** 2)
-        if intervention_l2 > 1e-8:
+        if intervention_l2 > float(self.cfg.cbf_intervention_thresh_l2):
             self.cbf_stats["modified"] += 1
 
         sep_barriers = []
@@ -1579,12 +1626,23 @@ class VlmCbfEnv:
             self.last_safe_vel[robot.base_id] = np.array([vx, vy], dtype=np.float32)
 
             if self.cfg.use_ik and robot.end_effector_link >= 0:
-                if self.phase in (Phase.CONTACT, Phase.PROBE, Phase.CORRECT, Phase.LIFT, Phase.TRANSPORT, Phase.PLACE):
+                if self.phase in (
+                    Phase.CONTACT,
+                    Phase.PROBE,
+                    Phase.CORRECT,
+                    Phase.REGRIP,
+                    Phase.LIFT,
+                    Phase.TRANSPORT,
+                    Phase.PLACE,
+                ):
                     self._apply_ik(robot)
                 else:
                     self._hold_arm_home(robot)
 
-            robot.grip_active = action.grip
+            grip_cmd = bool(action.grip)
+            if self.phase == Phase.REGRIP:
+                grip_cmd = self._regrip_forced_grip(robot, grip_cmd)
+            robot.grip_active = grip_cmd
             if robot.grip_active:
                 self._maybe_attach(robot)
             else:
@@ -1755,6 +1813,8 @@ class VlmCbfEnv:
             return
         if self.active_carry_mode != "constraint":
             return
+        if self.sim_time < float(robot.reattach_allowed_at):
+            return
         self.grasp_stats["attach_attempts"] += 1
         attach_dist = max(self.cfg.contact_dist, self.cfg.vacuum_attach_dist)
         closest = p.getClosestPoints(
@@ -1796,6 +1856,9 @@ class VlmCbfEnv:
             return
         p.removeConstraint(robot.constraint_id, physicsClientId=self.client_id)
         robot.constraint_id = None
+        robot.reattach_allowed_at = float(
+            self.sim_time + max(0.0, float(self.cfg.vacuum_reattach_cooldown_s))
+        )
         self.grasp_stats["detach_events"] += 1
         if reason == "stretch":
             self.grasp_stats["stretch_drop"] += 1
@@ -1811,6 +1874,20 @@ class VlmCbfEnv:
             return pos
         link_state = p.getLinkState(robot.arm_id, robot.end_effector_link, physicsClientId=self.client_id)
         return link_state[0]
+
+    def _end_effector_object_gap(self, robot: RobotInstance, query_dist: float) -> float:
+        if self.object_id is None:
+            return float("inf")
+        points = p.getClosestPoints(
+            bodyA=robot.arm_id,
+            bodyB=self.object_id,
+            distance=max(0.0, float(query_dist)),
+            linkIndexA=robot.end_effector_link,
+            physicsClientId=self.client_id,
+        )
+        if not points:
+            return float("inf")
+        return float(min(float(c[8]) for c in points))
 
     def _apply_separation_safety(self) -> None:
         positions = []
@@ -1871,6 +1948,8 @@ class VlmCbfEnv:
                 return
 
     def _maybe_fallback_carry_mode(self) -> None:
+        if not self.cfg.allow_kinematic_fallback:
+            return
         if self.cfg.carry_mode != "auto":
             return
         if self.active_carry_mode != "constraint":
@@ -1893,12 +1972,11 @@ class VlmCbfEnv:
         if not attached:
             return
 
-        obj_pos, _ = p.getBasePositionAndOrientation(self.object_id, physicsClientId=self.client_id)
-        obj_pos = np.array(obj_pos, dtype=np.float32)
-        break_dist = max(self.cfg.contact_dist * 1.5, self.cfg.vacuum_break_dist)
+        break_gap = max(self.cfg.contact_dist * 0.75, self.cfg.vacuum_break_dist)
+        query_dist = break_gap * 2.0 + max(self.cfg.contact_dist, 0.05)
         for robot in list(attached):
-            ee_pos = np.array(self._end_effector_pos(robot), dtype=np.float32)
-            if float(np.linalg.norm(ee_pos - obj_pos)) > break_dist:
+            gap = self._end_effector_object_gap(robot, query_dist=query_dist)
+            if gap > break_gap:
                 self._maybe_detach(robot, reason="stretch")
 
         attached = [robot for robot in self.robots if robot.constraint_id is not None]
@@ -1948,9 +2026,172 @@ class VlmCbfEnv:
 
     def _all_constraints_attached(self) -> bool:
         for robot in self.robots:
-            if robot.grip_active and robot.constraint_id is None:
+            if robot.spec.name in self.inactive_robot_names:
+                continue
+            if robot.constraint_id is None:
                 return False
         return True
+
+    def _active_robot_count(self) -> int:
+        return sum(1 for robot in self.robots if robot.spec.name not in self.inactive_robot_names)
+
+    def _attached_active_count(self, exclude_name: Optional[str] = None) -> int:
+        count = 0
+        for robot in self.robots:
+            if robot.spec.name in self.inactive_robot_names:
+                continue
+            if exclude_name is not None and robot.spec.name == exclude_name:
+                continue
+            if robot.constraint_id is not None:
+                count += 1
+        return count
+
+    def _robot_by_name(self, name: str) -> Optional[RobotInstance]:
+        for robot in self.robots:
+            if robot.spec.name == name:
+                return robot
+        return None
+
+    def _prepare_regrip_plan(self) -> bool:
+        if not self.cfg.regrip_enabled:
+            return False
+        if self.active_carry_mode != "constraint":
+            return False
+        if self.vlm_selected_idx < 0 or self.vlm_selected_idx >= len(self.vlm_hypotheses):
+            return False
+        measured = np.asarray(self.probe_load_fraction_measured, dtype=np.float32)
+        target = np.asarray(self.vlm_hypotheses[self.vlm_selected_idx].load_fractions, dtype=np.float32)
+        if measured.shape[0] != len(self.robots) or target.shape[0] != len(self.robots):
+            return False
+        measured = np.clip(measured, 1e-6, None)
+        measured = measured / float(np.sum(measured))
+        target = np.clip(target, 1e-6, None)
+        target = target / float(np.sum(target))
+
+        errors: List[Tuple[float, str]] = []
+        thresh = max(0.0, float(self.cfg.regrip_share_error_thresh))
+        for idx, robot in enumerate(self.robots):
+            if robot.spec.name in self.inactive_robot_names:
+                continue
+            err = abs(float(measured[idx] - target[idx]))
+            if err >= thresh:
+                errors.append((err, robot.spec.name))
+        if not errors:
+            return False
+        errors.sort(key=lambda item: item[0], reverse=True)
+        max_robots = max(0, int(self.cfg.regrip_max_robots))
+        if max_robots <= 0:
+            return False
+        order = [name for _err, name in errors[:max_robots]]
+        if not order:
+            return False
+        self.regrip_order = order
+        self.regrip_idx = 0
+        self.regrip_stage = "release"
+        self.regrip_attach_hold_since = None
+        return True
+
+    def _regrip_current_robot(self) -> Optional[RobotInstance]:
+        while self.regrip_idx < len(self.regrip_order):
+            name = str(self.regrip_order[self.regrip_idx])
+            robot = self._robot_by_name(name)
+            if robot is None or robot.spec.name in self.inactive_robot_names:
+                self.regrip_idx += 1
+                self.regrip_stage = "release"
+                self.regrip_attach_hold_since = None
+                continue
+            return robot
+        return None
+
+    def _regrip_min_attached_required(self) -> int:
+        active = self._active_robot_count()
+        if active <= 1:
+            return 0
+        req = int(max(1, self.cfg.regrip_min_attached_guard))
+        return min(req, active - 1)
+
+    def _regrip_forced_grip(self, robot: RobotInstance, commanded_grip: bool) -> bool:
+        if self.phase != Phase.REGRIP:
+            return bool(commanded_grip)
+        current = self._regrip_current_robot()
+        if current is None:
+            return True
+        if robot.spec.name != current.spec.name:
+            return True
+        if self.regrip_stage == "release":
+            min_req = self._regrip_min_attached_required()
+            if self._attached_active_count(exclude_name=current.spec.name) < min_req:
+                return True
+            return False
+        return True
+
+    def _update_regrip_phase(self) -> bool:
+        if not self.regrip_order:
+            return True
+        timeout = max(0.0, float(self.cfg.regrip_timeout_s))
+        if timeout > 1e-6 and self.phase_time >= timeout:
+            # Failed sequential regrip: reacquire full contact before continuing.
+            self.regrip_order = []
+            self.regrip_idx = 0
+            self.regrip_stage = "release"
+            self.regrip_attach_hold_since = None
+            self.phase = Phase.CONTACT
+            self.phase_time = 0.0
+            self.contact_all_attached_since = None
+            return False
+
+        current = self._regrip_current_robot()
+        if current is None:
+            self.regrip_order = []
+            self.regrip_idx = 0
+            self.regrip_stage = "release"
+            self.regrip_attach_hold_since = None
+            return True
+
+        if self.regrip_stage == "release":
+            if current.constraint_id is not None:
+                return False
+            if current.waypoint is not None:
+                pos, _ = p.getBasePositionAndOrientation(current.base_id, physicsClientId=self.client_id)
+                dist = float(np.linalg.norm(np.array(pos[:2], dtype=np.float32) - current.waypoint[:2]))
+                if dist > float(self.cfg.phase_correct_settle_dist):
+                    return False
+            self.regrip_stage = "attach"
+            self.regrip_attach_hold_since = None
+            return False
+
+        if current.constraint_id is None:
+            self.regrip_attach_hold_since = None
+            return False
+        if self.regrip_attach_hold_since is None:
+            self.regrip_attach_hold_since = self.sim_time
+            return False
+        if (self.sim_time - self.regrip_attach_hold_since) < max(0.0, float(self.cfg.regrip_attach_hold_s)):
+            return False
+
+        self.regrip_idx += 1
+        self.regrip_stage = "release"
+        self.regrip_attach_hold_since = None
+        if self.regrip_idx >= len(self.regrip_order):
+            self.regrip_order = []
+            return True
+        return False
+
+    def _contact_phase_complete(self) -> bool:
+        if self.active_carry_mode == "constraint":
+            if not self._all_constraints_attached():
+                self.contact_all_attached_since = None
+                return False
+            hold_s = max(0.0, float(self.cfg.phase_contact_attach_hold_s))
+            if hold_s <= 1e-6:
+                self.contact_all_attached_since = self.sim_time
+                return True
+            if self.contact_all_attached_since is None:
+                self.contact_all_attached_since = self.sim_time
+                return False
+            return (self.sim_time - self.contact_all_attached_since) >= hold_s
+        self.contact_all_attached_since = None
+        return self._all_gripping()
 
     def _contact_ready_names(self) -> List[str]:
         names: List[str] = []
@@ -2070,6 +2311,13 @@ class VlmCbfEnv:
         return True
 
     def _update_phase(self) -> None:
+        if self.phase != Phase.CONTACT:
+            self.contact_all_attached_since = None
+        if self.phase != Phase.REGRIP:
+            self.regrip_order = []
+            self.regrip_idx = 0
+            self.regrip_stage = "release"
+            self.regrip_attach_hold_since = None
         if self.cfg.use_udp_phase and self.udp_bus is not None:
             self._update_phase_distributed()
             return
@@ -2105,7 +2353,7 @@ class VlmCbfEnv:
                 return
 
         if self.phase == Phase.CONTACT:
-            if self._all_gripping():
+            if self._contact_phase_complete():
                 self.phase = Phase.PROBE if self.cfg.enable_probe_correct else Phase.LIFT
                 self.phase_time = 0.0
                 self.probe_started_at = None
@@ -2124,9 +2372,21 @@ class VlmCbfEnv:
             return
 
         if self.phase == Phase.CORRECT and all(v == 1 for v in self._phase_local_ready_map().values()):
+            if self._prepare_regrip_plan():
+                self.phase = Phase.REGRIP
+                self.phase_time = 0.0
+                return
             self.phase = Phase.LIFT
             self.phase_time = 0.0
             return
+
+        if self.phase == Phase.REGRIP:
+            if self._update_regrip_phase():
+                self.phase = Phase.LIFT
+                self.phase_time = 0.0
+                return
+            if self.phase != Phase.REGRIP:
+                return
 
         if self.phase == Phase.LIFT and self.current_lift >= self.cfg.lift_height - 1e-3:
             self.phase = Phase.TRANSPORT
@@ -2148,6 +2408,11 @@ class VlmCbfEnv:
             self._plan_formation()
             self.phase = Phase.APPROACH
             self.phase_time = 0.0
+            return
+        if self.phase == Phase.REGRIP:
+            if self._update_regrip_phase():
+                self.phase = Phase.LIFT
+                self.phase_time = 0.0
             return
         if self.phase == Phase.PLACE:
             if self.current_lift <= 1e-3:
@@ -2189,7 +2454,7 @@ class VlmCbfEnv:
             return
 
         if self.phase == Phase.CONTACT:
-            if not self._all_gripping():
+            if not self._contact_phase_complete():
                 if self.phase_time >= self.cfg.phase_contact_timeout_s and self._handle_contact_timeout():
                     return
             else:
@@ -2208,6 +2473,10 @@ class VlmCbfEnv:
             return
 
         if self.phase == Phase.CORRECT:
+            if self._prepare_regrip_plan():
+                self.phase = Phase.REGRIP
+                self.phase_time = 0.0
+                return
             self.phase = Phase.LIFT
             self.phase_time = 0.0
             return
@@ -2280,14 +2549,17 @@ class VlmCbfEnv:
     def _load_vlm_json(self) -> Optional[dict]:
         if not self.cfg.vlm_json_path:
             return None
-        path = Path(self.cfg.vlm_json_path)
-        if not path.exists():
+        path = str(self.cfg.vlm_json_path)
+        if not os.path.isfile(path):
             return None
-        mtime = path.stat().st_mtime
+        try:
+            mtime = float(os.path.getmtime(path))
+        except OSError:
+            return None
         if self._vlm_json_cache and self._vlm_json_cache.get("_mtime") == mtime:
             return self._vlm_json_cache.get("data")
         try:
-            with path.open("r", encoding="utf-8") as handle:
+            with open(path, "r", encoding="utf-8") as handle:
                 data = json.load(handle)
         except Exception:
             return None

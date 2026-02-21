@@ -2,7 +2,9 @@ import argparse
 import json
 from pathlib import Path
 import time
+from typing import List
 
+import numpy as np
 import pybullet as p
 
 from vlm_cbf_env import TaskConfig, VlmCbfEnv
@@ -150,8 +152,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--auto-vlm",
         action="store_true",
-        help="Capture an image and run selected VLM backend before planning",
+        help="Capture observe-phase images and run selected VLM backend before planning",
     )
+    parser.add_argument(
+        "--auto-vlm-mode",
+        choices=("robot4", "single"),
+        default="robot4",
+        help="Observe camera mode: 4 robot ego views (robot4) or single scene view",
+    )
+    parser.add_argument("--auto-vlm-view-dir", default="vlm_auto_views", help="Directory to store observe images")
+    parser.add_argument("--auto-vlm-width", type=int, default=640, help="Observe image width")
+    parser.add_argument("--auto-vlm-height", type=int, default=480, help="Observe image height")
+    parser.add_argument("--auto-vlm-fov", type=float, default=60.0, help="Observe camera FOV")
+    parser.add_argument("--vlm-fusion-k", type=int, default=3, help="Number of ranked fused hypotheses")
     parser.add_argument(
         "--vlm-backend",
         choices=("cpu", "llava"),
@@ -242,6 +255,55 @@ def _capture_scene(
     )
 
 
+def _capture_robot_vlm_images(
+    env: VlmCbfEnv,
+    out_dir: Path,
+    width: int = 640,
+    height: int = 480,
+    fov: float = 60.0,
+    renderer: int = p.ER_BULLET_HARDWARE_OPENGL,
+) -> List[Path]:
+    if env.object_id is None:
+        raise RuntimeError("Object not spawned; cannot capture VLM images.")
+    try:
+        import imageio.v2 as imageio
+    except Exception as exc:  # pragma: no cover
+        raise ImportError("imageio is required for auto VLM capture.") from exc
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    obj_pos, _ = p.getBasePositionAndOrientation(env.object_id, physicsClientId=env.client_id)
+    obj_pos = np.asarray(obj_pos, dtype=np.float32)
+    target = obj_pos + np.array([0.0, 0.0, 0.20], dtype=np.float32)
+    aspect = width / float(height)
+    proj = p.computeProjectionMatrixFOV(fov=fov, aspect=aspect, nearVal=0.05, farVal=6.0)
+
+    image_paths: List[Path] = []
+    for idx, robot in enumerate(env.robots):
+        base_pos, base_quat = p.getBasePositionAndOrientation(robot.base_id, physicsClientId=env.client_id)
+        base_pos = np.asarray(base_pos, dtype=np.float32)
+        yaw = float(p.getEulerFromQuaternion(base_quat)[2])
+        forward = np.array([np.cos(yaw), np.sin(yaw), 0.0], dtype=np.float32)
+        eye = base_pos + 0.15 * forward + np.array([0.0, 0.0, 0.80], dtype=np.float32)
+
+        view = p.computeViewMatrix(
+            cameraEyePosition=eye.tolist(),
+            cameraTargetPosition=target.tolist(),
+            cameraUpVector=[0.0, 0.0, 1.0],
+        )
+        _, _, rgba, _, _ = p.getCameraImage(
+            width=width,
+            height=height,
+            viewMatrix=view,
+            projectionMatrix=proj,
+            renderer=renderer,
+        )
+        rgb = np.reshape(rgba, (height, width, 4))[:, :, :3].astype(np.uint8)
+        image_path = out_dir / f"robot_{idx:02d}_{robot.spec.name}.png"
+        imageio.imwrite(image_path, rgb)
+        image_paths.append(image_path)
+    return image_paths
+
+
 def _run_cpu_vlm(model_path: Path, image_path: Path) -> dict:
     try:
         from infer_vlm_cpu import infer_image
@@ -265,6 +327,39 @@ def _run_llava_vlm(model_ref: str, adapter_path: str, image_path: Path) -> dict:
         model_id=model_id,
         model_path=model_path,
         adapter=adapter_path,
+    )
+
+
+def _run_multiview_vlm(
+    backend: str,
+    model_ref: str,
+    adapter_path: str,
+    image_paths: List[Path],
+    k: int,
+) -> dict:
+    if backend == "cpu":
+        try:
+            from vlm_multiview import infer_multiview_cpu
+        except Exception as exc:  # pragma: no cover
+            raise ImportError("vlm_multiview.py is required for multi-view CPU inference.") from exc
+        return infer_multiview_cpu(model_path=Path(model_ref), image_paths=image_paths, k=k)
+
+    try:
+        from vlm_multiview import infer_multiview_llava
+    except Exception as exc:  # pragma: no cover
+        raise ImportError("vlm_multiview.py is required for multi-view LLaVA inference.") from exc
+
+    model_path = ""
+    model_id = model_ref
+    if Path(model_ref).exists():
+        model_path = model_ref
+        model_id = "llava-hf/llava-1.5-7b-hf"
+    return infer_multiview_llava(
+        model_id=model_id,
+        adapter=adapter_path,
+        model_path=model_path,
+        image_paths=image_paths,
+        k=k,
     )
 
 
@@ -315,13 +410,43 @@ def main() -> None:
         screenshot_dir = Path(args.screenshots_dir)
         screenshot_dir.mkdir(parents=True, exist_ok=True)
     if args.auto_vlm:
-        image_path = Path("vlm_auto.png")
         renderer = p.ER_TINY_RENDERER if args.headless else p.ER_BULLET_HARDWARE_OPENGL
-        _capture_vlm_image(env, image_path, renderer=renderer)
-        if args.vlm_backend == "cpu":
-            output = _run_cpu_vlm(Path(args.vlm_model), image_path)
+        if args.auto_vlm_mode == "robot4":
+            image_paths = _capture_robot_vlm_images(
+                env=env,
+                out_dir=Path(args.auto_vlm_view_dir),
+                width=args.auto_vlm_width,
+                height=args.auto_vlm_height,
+                fov=args.auto_vlm_fov,
+                renderer=renderer,
+            )
         else:
-            output = _run_llava_vlm(args.vlm_model, args.vlm_adapter, image_path)
+            image_path = Path("vlm_auto.png")
+            _capture_vlm_image(
+                env,
+                image_path,
+                width=args.auto_vlm_width,
+                height=args.auto_vlm_height,
+                fov=args.auto_vlm_fov,
+                renderer=renderer,
+            )
+            image_paths = [image_path]
+
+        if len(image_paths) <= 1:
+            if args.vlm_backend == "cpu":
+                output = _run_cpu_vlm(Path(args.vlm_model), image_paths[0])
+            else:
+                output = _run_llava_vlm(args.vlm_model, args.vlm_adapter, image_paths[0])
+        else:
+            output = _run_multiview_vlm(
+                backend=args.vlm_backend,
+                model_ref=args.vlm_model,
+                adapter_path=args.vlm_adapter,
+                image_paths=image_paths,
+                k=args.vlm_fusion_k,
+            )
+        output["input_images"] = [str(pth) for pth in image_paths]
+        output["observe_mode"] = str(args.auto_vlm_mode)
         Path(args.vlm_out).write_text(json.dumps(output, indent=2), encoding="utf-8")
     steps = 0
     last_phase = None

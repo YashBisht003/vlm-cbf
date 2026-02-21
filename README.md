@@ -221,107 +221,6 @@ For large-scale training:
 Developed as part of research on safe multi-agent reinforcement learning for cooperative robotics.
 
 
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_vlm_llava_lora.py --model-id llava-hf/llava-1.5-7b-hf --train-jsonl vlm_dataset\train.jsonl --val-jsonl vlm_dataset\val.jsonl --image-root vlm_dataset --out llava_lora_out --epochs 3 --lora-rank 16 --lora-alpha 32 --use-4bit --fp16
-```
-
-Inference with LoRA adapter:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" infer_vlm_llava.py --model-id llava-hf/llava-1.5-7b-hf --adapter llava_lora_out\adapter --image vlm_dataset\images\sample_000000_view_00.png --out llava_formation.json
-```
-
-Formation metric evaluation:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" eval_vlm_formations.py --jsonl vlm_dataset\val.jsonl --image-root vlm_dataset --model-id llava-hf/llava-1.5-7b-hf --adapter llava_lora_out\adapter --out-csv vlm_eval_samples.csv --out-json vlm_eval_metrics.json
-```
-
-Zero-shot vs fine-tuned comparison:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" eval_vlm_formations.py --jsonl vlm_dataset\val.jsonl --image-root vlm_dataset --model-id llava-hf/llava-1.5-7b-hf --out-json vlm_eval_zeroshot.json
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" eval_vlm_formations.py --jsonl vlm_dataset\val.jsonl --image-root vlm_dataset --model-id llava-hf/llava-1.5-7b-hf --adapter llava_lora_out\adapter --out-json vlm_eval_finetuned.json
-```
-
-## Train GNN Policy (MAPPO)
-This trains a decentralized GNN policy with a centralized critic (CTDE).
-It can run on CPU, but will be much faster on a GPU.
-The critic input includes:
-- concatenated per-agent observations
-- explicit global state (`object pose`, `goal`, `phase`, `belief mean/cov`, force stats)
-- per-agent observation uses the paper-style 101D structure
-  (`ego`, `object-relative`, `forces`, `goal`, `neighbors`, `belief`, `safety`, `phase`)
-
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --steps-per-update 512 --out mappo_policy.pt --checkpoint-dir checkpoints --save-every 25 --save-latest --log-interval 10
-```
-
-Parallel rollout collection (recommended on multi-core CPU/GPU nodes):
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --num-envs 8 --updates 1600 --steps-per-update 512 --checkpoint-dir checkpoints
-```
-
-Optional neural-CBF pretrain warm start (recommended):
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --steps-per-update 512 --train-neural-cbf --pretrain-neural-cbf-steps 20000 --pretrain-neural-cbf-epochs 3 --checkpoint-dir checkpoints
-```
-
-Resume from latest checkpoint:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --resume --checkpoint-dir checkpoints --save-latest
-```
-
-Resume from best checkpoint:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --resume-best --checkpoint-dir checkpoints --save-latest --best-metric success_rate
-```
-
-CPU-focused run (limit Torch threads explicitly):
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --steps-per-update 384 --torch-threads 4 --checkpoint-dir checkpoints --save-latest
-```
-
-GPU-focused run:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --device cuda --updates 1600 --steps-per-update 512 --checkpoint-dir checkpoints --save-latest
-```
-
-Train learned residual correction model (used in `Correct` phase):
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_residual_corrector.py --out residual_corrector.joblib --samples 40000
-```
-
-Generate residual dataset from simulation and train on it:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" generate_residual_dataset.py --out residual_dataset.csv --episodes 3000 --headless
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_residual_corrector.py --dataset-csv residual_dataset.csv --out residual_corrector.joblib
-```
-
-Use learned residual model during training/evaluation:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" train_mappo.py --headless --updates 1600 --residual-model residual_corrector.joblib
-```
-
-Checkpoint behavior:
-- `mappo_policy_latest.pt` is saved every update (unless `--no-save-latest`).
-- `mappo_policy_update_XXXX.pt` is saved every `--save-every` updates.
-- `mappo_policy_best.pt` is updated when `--best-metric` improves.
-- Resume searches latest, then latest numbered checkpoint, then final output.
-- Save verification is enabled by default (`--verify-checkpoints` / `--no-verify-checkpoints`).
-
-Run the trained policy:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_policy.py --model mappo_policy.pt --headless --deterministic
-```
-
-Evaluate trained policy over many episodes:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" eval_policy_runs.py --model checkpoints\mappo_policy_best.pt --episodes 500 --headless --out eval_learned_policy.csv
-```
-
-## IROS Suite
-Run full train/eval/report pipeline:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train
-```
 
 This script runs:
 - MAPPO training (or resume)
@@ -330,20 +229,6 @@ This script runs:
 - Plot generation + summary tables
 - `suite_summary.csv` and `suite_summary.md`
 
-Include learned-policy neural CBF ablation:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train --run-neural-ablation
-```
-
-Include probe/correct ablations (`no-probe`, `probe+heuristic`, `probe+learned`):
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train --generate-residual-dataset --train-residual-model --run-probe-ablation
-```
-
-Include VLM formation evaluation in suite:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_iros_suite.py --headless --device cuda --episodes 500 --updates 1600 --resume-train --run-vlm-eval --vlm-model-id llava-hf/llava-1.5-7b-hf --vlm-adapter llava_lora_out\adapter
-```
 
 ## Safety Filter (CBF/QP)
 The environment applies a CBF/QP safety filter per robot using OSQP.
@@ -421,20 +306,7 @@ Example:
 }
 ```
 
-Use it with:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_demo.py --vlm-json path\to\formation.json
-```
 
-Auto infer formation inside demo:
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" run_demo.py --auto-vlm --auto-vlm-mode robot4 --vlm-backend llava --vlm-model llava-hf/llava-1.5-7b-hf --vlm-adapter llava_lora_out\adapter --vlm-fusion-k 3
-```
-
-Multi-view fusion from 4 robot images (standalone):
-```powershell
-& "C:\Users\Yash Bisht\.venvs\pybullet_vlm_cbf\Scripts\python.exe" infer_vlm_multiview.py --backend llava --model-id llava-hf/llava-1.5-7b-hf --adapter llava_lora_out\adapter --images view0.png view1.png view2.png view3.png --k 3 --out formation_multiview.json
-```
 
 ## Quantec URDF Notes
 If you use a KUKA Quantec URDF/xacro, prefer passing a tool-frame link name

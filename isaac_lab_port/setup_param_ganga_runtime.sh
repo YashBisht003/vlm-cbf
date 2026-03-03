@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
+trap 'echo "ERROR: setup failed at line ${LINENO}: ${BASH_COMMAND}"' ERR
 
 usage() {
   cat <<'EOF'
@@ -87,7 +88,11 @@ echo ">>> Date: $(date)"
 echo ">>> GPU:"
 nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 
-GLIBC_VER="$(ldd --version | head -n 1 | sed -E 's/.* ([0-9]+\.[0-9]+).*/\1/')"
+GLIBC_VER="$(ldd --version 2>/dev/null | sed -nE '1 s/.* ([0-9]+\.[0-9]+).*/\1/p')"
+if [[ -z "${GLIBC_VER}" ]]; then
+  echo "ERROR: failed to parse GLIBC version from ldd --version output."
+  exit 2
+fi
 echo ">>> GLIBC: ${GLIBC_VER}"
 python3 - <<PY
 import sys

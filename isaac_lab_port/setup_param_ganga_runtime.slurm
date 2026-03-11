@@ -8,7 +8,7 @@
 #SBATCH --time=12:00:00
 #SBATCH --output=isaac_setup_%j.out
 #SBATCH --error=isaac_setup_%j.err
-#SBATCH --chdir=/home/y_bisht_me.iitr/projects/vlm-cbf
+#SBATCH --chdir=/home/ub/yash_projects/vlm-cbf
 #SBATCH --export=ALL
 
 set -euo pipefail
@@ -24,7 +24,8 @@ fi
 
 bash isaac_lab_port/setup_param_ganga_runtime.sh \
   --env-name isaaclab_232 \
-  --isaaclab-dir "$HOME/IsaacLab" \
-  --project-dir "/home/y_bisht_me.iitr/projects/vlm-cbf"
+  --env-prefix "/home/ub/yash_projects/vlm-cbf/.conda_envs/isaaclab_232" \
+  --isaaclab-dir "/home/ub/yash_projects/vlm-cbf/third_party/IsaacLab" \
+  --project-dir "/home/ub/yash_projects/vlm-cbf"
 
 echo ">>> Isaac setup job finished at $(date)"

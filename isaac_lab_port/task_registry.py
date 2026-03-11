@@ -13,12 +13,6 @@ try:
 except ImportError:
     import agents as _agents
 
-try:
-    from .direct_marl_env import NoVlmCoopTransportDirectEnv, NoVlmCoopTransportEnvCfg
-except ImportError:
-    from direct_marl_env import NoVlmCoopTransportDirectEnv, NoVlmCoopTransportEnvCfg
-
-
 TASK_ID = "Isaac-NoVlm-CoopTransport-Direct-v0"
 _agents_module_name = _agents.__name__
 if _agents_module_name == "agents":
@@ -33,10 +27,20 @@ class TaskRegistration:
     kwargs: Dict
 
 
+def _load_env_types():
+    try:
+        from .direct_marl_env import NoVlmCoopTransportDirectEnv, NoVlmCoopTransportEnvCfg
+    except ImportError:
+        from direct_marl_env import NoVlmCoopTransportDirectEnv, NoVlmCoopTransportEnvCfg
+    return NoVlmCoopTransportDirectEnv, NoVlmCoopTransportEnvCfg
+
+
 def register_no_vlm_task(force: bool = False) -> TaskRegistration:
+    NoVlmCoopTransportDirectEnv, NoVlmCoopTransportEnvCfg = _load_env_types()
     kwargs = {
         "env_cfg_entry_point": NoVlmCoopTransportEnvCfg,
         "skrl_cfg_entry_point": SKRL_CFG_ENTRY_POINT,
+        "skrl_mappo_cfg_entry_point": SKRL_CFG_ENTRY_POINT,
     }
 
     already = False

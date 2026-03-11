@@ -8,15 +8,15 @@
 #SBATCH --time=24:00:00
 #SBATCH --output=isaac_mappo_%j.out
 #SBATCH --error=isaac_mappo_%j.err
-#SBATCH --chdir=/home/y_bisht_me.iitr/projects/vlm-cbf
+#SBATCH --chdir=/home/ub/yash_projects/vlm-cbf
 #SBATCH --export=ALL
 
 set -euo pipefail
 
 echo ">>> Started on $(hostname) at $(date)"
 
-# Update this path to your Isaac Lab python executable.
-PYTHON_BIN="$HOME/miniconda3/envs/isaaclab_232/bin/python"
+# Project-local Isaac environment.
+PYTHON_BIN="/home/ub/yash_projects/vlm-cbf/.conda_envs/isaaclab_232/bin/python"
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "ERROR: expected python not found at ${PYTHON_BIN}"
   exit 1

@@ -36,3 +36,7 @@ vlm_eval_*.json
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Local Isaac / environment artifacts
+.conda_envs/
+third_party/

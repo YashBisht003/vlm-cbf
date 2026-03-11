@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import importlib
 from dataclasses import dataclass, field
-from typing import Dict, Sequence
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence
 
+import numpy as np
 import torch
 
 try:
@@ -30,6 +32,7 @@ try:
     from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
     from isaaclab.envs import DirectMARLEnv, DirectMARLEnvCfg
     from isaaclab.scene import InteractiveSceneCfg
+    from isaaclab.sensors import ContactSensorCfg
     from isaaclab.sim import SimulationCfg
     from isaaclab.utils import configclass
 except Exception:
@@ -74,6 +77,14 @@ except Exception:
         num_envs: int = 1
         env_spacing: float = 1.0
         replicate_physics: bool = True
+
+    @dataclass
+    class ContactSensorCfg:
+        prim_path: str = ""
+        track_pose: bool = False
+        debug_vis: bool = False
+        update_period: float = 0.0
+        filter_prim_paths_expr: List[str] = field(default_factory=list)
 
     @dataclass
     class ArticulationCfg:
@@ -193,6 +204,24 @@ except ImportError:
     from torch_phase_manager import PHASE_TO_ID, Phase, PhaseConfig, TorchBatchedNoVlmPhaseManager, TorchBatchedPhaseInputs
     from vacuum_attachment import AutoAttachmentBackend
 
+try:
+    from belief_ekf import BeliefEKF
+    from cbf_qp import solve_cbf_qp
+    from neural_cbf import NeuralCbfRuntime
+    from residual_corrector import FEATURE_NAMES as RESIDUAL_FEATURE_NAMES
+    from residual_corrector import ResidualCorrectorRuntime
+except ImportError:
+    import sys
+
+    _ROOT = Path(__file__).resolve().parents[1]
+    if str(_ROOT) not in sys.path:
+        sys.path.insert(0, str(_ROOT))
+    from belief_ekf import BeliefEKF
+    from cbf_qp import solve_cbf_qp
+    from neural_cbf import NeuralCbfRuntime
+    from residual_corrector import FEATURE_NAMES as RESIDUAL_FEATURE_NAMES
+    from residual_corrector import ResidualCorrectorRuntime
+
 
 BASE_ACT_DIM = 3
 ARM_ACT_DIM = 3
@@ -221,6 +250,14 @@ def _clone_cfg_with_prim_path(cfg_obj, prim_path: str):
     return out
 
 
+def _enable_contact_sensors(cfg_obj):
+    out = copy.deepcopy(cfg_obj)
+    spawn = getattr(out, "spawn", None)
+    if spawn is not None and hasattr(spawn, "activate_contact_sensors"):
+        setattr(spawn, "activate_contact_sensors", True)
+    return out
+
+
 def _load_first_attr(candidates: Sequence[tuple[str, str]]):
     for mod_name, attr_name in candidates:
         try:
@@ -242,13 +279,13 @@ def _resolve_implicit_actuator_cfg_cls():
 def _default_ridgeback_franka_cfg(prim_path: str) -> ArticulationCfg:
     base = _load_first_attr(
         (
-            ("isaaclab_assets.robots.clearpath", "RIDGEBACK_FRANKA_CFG"),
-            ("isaaclab_assets.robots.clearpath.ridgeback_franka", "RIDGEBACK_FRANKA_CFG"),
-            ("isaaclab_assets", "RIDGEBACK_FRANKA_CFG"),
+            ("isaaclab_assets.robots.ridgeback_franka", "RIDGEBACK_FRANKA_PANDA_CFG"),
+            ("isaaclab_assets.robots", "RIDGEBACK_FRANKA_PANDA_CFG"),
+            ("isaaclab_assets", "RIDGEBACK_FRANKA_PANDA_CFG"),
         )
     )
     if base is not None:
-        return _clone_cfg_with_prim_path(base, prim_path)
+        return _clone_cfg_with_prim_path(_enable_contact_sensors(base), prim_path)
 
     usd_kwargs = {
         "usd_path": "Robots/Clearpath/RidgebackFranka/ridgeback_franka.usd",
@@ -330,6 +367,30 @@ def _default_payload_cfg(prim_path: str) -> RigidObjectCfg:
         )
     )
     if base is None:
+        cuboid_cfg_cls = getattr(sim_utils, "CuboidCfg", None)
+        rigid_props_cls = getattr(sim_utils, "RigidBodyPropertiesCfg", None)
+        mass_props_cls = getattr(sim_utils, "MassPropertiesCfg", None)
+        material_cls = getattr(sim_utils, "RigidBodyMaterialCfg", None)
+        preview_cls = getattr(sim_utils, "PreviewSurfaceCfg", None)
+        if cuboid_cfg_cls is not None:
+            spawn_kwargs = {
+                "size": (0.8, 0.6, 0.4),
+            }
+            if rigid_props_cls is not None:
+                spawn_kwargs["rigid_props"] = rigid_props_cls(
+                    disable_gravity=False,
+                    max_depenetration_velocity=5.0,
+                )
+            if mass_props_cls is not None:
+                spawn_kwargs["mass_props"] = mass_props_cls(mass=140.0)
+            if material_cls is not None:
+                spawn_kwargs["physics_material"] = material_cls()
+            if preview_cls is not None:
+                spawn_kwargs["visual_material"] = preview_cls(diffuse_color=(0.25, 0.55, 0.75))
+            return RigidObjectCfg(
+                prim_path=prim_path,
+                spawn=cuboid_cfg_cls(**spawn_kwargs),
+            )
         return RigidObjectCfg(
             prim_path=prim_path,
             spawn=sim_utils.UsdFileCfg(usd_path="Props/Blocks/block.usd"),
@@ -337,19 +398,10 @@ def _default_payload_cfg(prim_path: str) -> RigidObjectCfg:
     return _clone_cfg_with_prim_path(base, prim_path)
 
 
-def _build_agent_spaces(agent_names: Sequence[str]) -> tuple[Dict[str, object], Dict[str, object], Dict[str, object]]:
-    observation_spaces = {
-        name: gym.spaces.Box(low=-1.0e6, high=1.0e6, shape=(AGENT_OBS_DIM,), dtype=float)
-        for name in agent_names
-    }
-    action_spaces = {
-        name: gym.spaces.Box(low=-1.0, high=1.0, shape=(AGENT_ACT_DIM,), dtype=float)
-        for name in agent_names
-    }
-    shared_observation_spaces = {
-        name: gym.spaces.Box(low=-1.0e6, high=1.0e6, shape=(CENTRAL_STATE_DIM,), dtype=float)
-        for name in agent_names
-    }
+def _build_agent_spaces(agent_names: Sequence[str]) -> tuple[Dict[str, int], Dict[str, int], Dict[str, int]]:
+    observation_spaces = {name: AGENT_OBS_DIM for name in agent_names}
+    action_spaces = {name: AGENT_ACT_DIM for name in agent_names}
+    shared_observation_spaces = {name: CENTRAL_STATE_DIM for name in agent_names}
     return observation_spaces, action_spaces, shared_observation_spaces
 
 
@@ -359,6 +411,47 @@ class NoVlmSceneCfg(InteractiveSceneCfg):
     num_envs: int = 128
     env_spacing: float = 8.0
     replicate_physics: bool = True
+    robot_0: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_0"))
+    robot_1: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_1"))
+    robot_2: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_2"))
+    robot_3: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_3"))
+    payload: RigidObjectCfg = field(default_factory=lambda: _default_payload_cfg(f"{ENV_REGEX_NS}/Payload"))
+    contact_robot_0: ContactSensorCfg = field(
+        default_factory=lambda: ContactSensorCfg(
+            prim_path=f"{ENV_REGEX_NS}/Robot_0/panda_hand",
+            track_pose=False,
+            debug_vis=False,
+            update_period=0.0,
+            filter_prim_paths_expr=[f"{ENV_REGEX_NS}/Payload"],
+        )
+    )
+    contact_robot_1: ContactSensorCfg = field(
+        default_factory=lambda: ContactSensorCfg(
+            prim_path=f"{ENV_REGEX_NS}/Robot_1/panda_hand",
+            track_pose=False,
+            debug_vis=False,
+            update_period=0.0,
+            filter_prim_paths_expr=[f"{ENV_REGEX_NS}/Payload"],
+        )
+    )
+    contact_robot_2: ContactSensorCfg = field(
+        default_factory=lambda: ContactSensorCfg(
+            prim_path=f"{ENV_REGEX_NS}/Robot_2/panda_hand",
+            track_pose=False,
+            debug_vis=False,
+            update_period=0.0,
+            filter_prim_paths_expr=[f"{ENV_REGEX_NS}/Payload"],
+        )
+    )
+    contact_robot_3: ContactSensorCfg = field(
+        default_factory=lambda: ContactSensorCfg(
+            prim_path=f"{ENV_REGEX_NS}/Robot_3/panda_hand",
+            track_pose=False,
+            debug_vis=False,
+            update_period=0.0,
+            filter_prim_paths_expr=[f"{ENV_REGEX_NS}/Payload"],
+        )
+    )
 
 
 @configclass
@@ -375,26 +468,37 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
     arm_delta_limit_rad: float = 0.35
     approach_radius_m: float = 1.2
     fine_approach_radius_m: float = 0.55
+    object_mass_nominal_kg: float = 140.0
+    payload_dims_m: tuple[float, float, float] = (0.8, 0.6, 0.4)
+    separation_min_m: float = 0.5
+    speed_limit_mps: float = 0.25
+    yaw_rate_limit_radps: float = 1.2
     contact_force_threshold_n: float = 5.0
     contact_force_balance_std_n: float = 20.0
     contact_force_overload_n: float = 220.0
+    cbf_alpha: float = 2.0
+    cbf_slack_weight: float = 100.0
+    cbf_slack_max: float = 3.0
+    use_cbf: bool = True
+    use_belief_ekf: bool = True
+    use_neural_cbf: bool = False
+    neural_cbf_hidden: int = 64
+    neural_cbf_model_path: str = ""
+    residual_model_path: str = ""
+    residual_gain: float = 0.12
+    residual_max_offset_m: float = 0.12
     lift_height_m: float = 0.18
     place_height_m: float = 0.09
     goal_tolerance_m: float = 0.30
     sim: SimulationCfg = field(default_factory=lambda: SimulationCfg(dt=0.02, device="cuda:0"))
     scene: NoVlmSceneCfg = field(default_factory=NoVlmSceneCfg)
-    robot_0: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_0"))
-    robot_1: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_1"))
-    robot_2: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_2"))
-    robot_3: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_3"))
-    payload: RigidObjectCfg = field(default_factory=lambda: _default_payload_cfg(f"{ENV_REGEX_NS}/Payload"))
 
     # Do not use deprecated num_observations/num_actions.
     possible_agents: tuple[str, ...] = field(default_factory=tuple)
     robot_prim_paths: tuple[str, ...] = field(default_factory=tuple)
-    observation_spaces: Dict[str, object] = field(default_factory=dict)
-    action_spaces: Dict[str, object] = field(default_factory=dict)
-    shared_observation_spaces: Dict[str, object] = field(default_factory=dict)
+    observation_spaces: Dict[str, int] = field(default_factory=dict)
+    action_spaces: Dict[str, int] = field(default_factory=dict)
+    shared_observation_spaces: Dict[str, int] = field(default_factory=dict)
 
     # Positive value means env will use explicit _get_states() for critic state.
     state_space: int = CENTRAL_STATE_DIM
@@ -426,6 +530,9 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self.possible_agents = list(cfg.possible_agents)
         self._num_envs = int(cfg.scene.num_envs)
         self._device = torch.device(cfg.device)
+        self._belief_ekf: List[BeliefEKF] = []
+        self._neural_cbf_runtime: Optional[NeuralCbfRuntime] = None
+        self._residual_runtime: Optional[ResidualCorrectorRuntime] = None
         self._last_actions = {
             agent: torch.zeros((self._num_envs, AGENT_ACT_DIM), dtype=torch.float32, device=self._device)
             for agent in self.possible_agents
@@ -440,6 +547,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._attachment_count_buf = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
         self._robot_entities: dict[str, Articulation] = {}
         self._payload_entity: RigidObject | None = None
+        self._contact_sensors: dict[str, object] = {}
         self._goal_xy = torch.tensor([2.5, 0.0], dtype=torch.float32, device=self._device).view(1, 2).repeat(
             self._num_envs, 1
         )
@@ -454,7 +562,52 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._base_contact_force_n = torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
         self._all_attached_mask = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
         self._contact_force_cache: Dict[str, torch.Tensor] = {}
+        self._belief_mu = torch.zeros((self._num_envs, 7), dtype=torch.float32, device=self._device)
+        self._belief_cov_diag = torch.zeros((self._num_envs, 7), dtype=torch.float32, device=self._device)
+        self._belief_uncertainty = torch.zeros((self._num_envs, 2), dtype=torch.float32, device=self._device)
+        self._cbf_slack = torch.zeros((self._num_envs, len(self.possible_agents)), dtype=torch.float32, device=self._device)
+        self._cbf_applied = torch.zeros((self._num_envs, len(self.possible_agents)), dtype=torch.bool, device=self._device)
+        self._neural_barrier = torch.zeros((self._num_envs, len(self.possible_agents)), dtype=torch.float32, device=self._device)
+        self._residual_goal_offset = torch.zeros((self._num_envs, 2), dtype=torch.float32, device=self._device)
+        self._init_belief_runtime()
+        self._init_model_runtime()
         super().__init__(cfg=cfg, **kwargs)
+
+    def _init_belief_runtime(self) -> None:
+        self._belief_ekf = []
+        dt = float(self.cfg.sim.dt) * float(max(1, int(self.cfg.decimation)))
+        dims = np.asarray(self.cfg.payload_dims_m, dtype=np.float32)
+        for _ in range(self._num_envs):
+            ekf = BeliefEKF(dt=dt)
+            ekf.initialize(
+                mass_kg=float(self.cfg.object_mass_nominal_kg),
+                com_offset_xyz=(0.0, 0.0, 0.0),
+                dims_xyz=dims,
+            )
+            self._belief_ekf.append(ekf)
+        self._sync_belief_tensors()
+
+    def _init_model_runtime(self) -> None:
+        if bool(self.cfg.use_neural_cbf):
+            self._neural_cbf_runtime = NeuralCbfRuntime(
+                mu_dim=7,
+                hidden=int(self.cfg.neural_cbf_hidden),
+                model_path=str(self.cfg.neural_cbf_model_path or ""),
+                device=str(self._device),
+            )
+        residual_path = str(self.cfg.residual_model_path or "").strip()
+        if residual_path:
+            self._residual_runtime = ResidualCorrectorRuntime(residual_path)
+
+    def _sync_belief_tensors(self) -> None:
+        if not self._belief_ekf:
+            return
+        mu = np.stack([ekf.mean() for ekf in self._belief_ekf], axis=0).astype(np.float32)
+        cov_diag = np.stack([np.diag(ekf.covariance()) for ekf in self._belief_ekf], axis=0).astype(np.float32)
+        unc = np.asarray([ekf.risk_components() for ekf in self._belief_ekf], dtype=np.float32)
+        self._belief_mu = torch.as_tensor(mu, dtype=torch.float32, device=self._device)
+        self._belief_cov_diag = torch.as_tensor(cov_diag, dtype=torch.float32, device=self._device)
+        self._belief_uncertainty = torch.as_tensor(unc, dtype=torch.float32, device=self._device)
 
     def _setup_scene(self) -> None:
         # Mandatory for replicated environments.
@@ -490,6 +643,12 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         if payload is None and hasattr(self.scene, "rigid_objects"):
             payload = self.scene.rigid_objects.get("payload")
         self._payload_entity = payload
+        self._contact_sensors = {}
+        if hasattr(self.scene, "sensors"):
+            for idx, agent_name in enumerate(self.possible_agents):
+                sensor = self.scene.sensors.get(f"contact_robot_{idx}")
+                if sensor is not None:
+                    self._contact_sensors[agent_name] = sensor
         self._configure_joint_groups()
 
     def _joint_names(self, entity: Articulation) -> list[str]:
@@ -615,6 +774,27 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             self._payload_entity.update(sim_dt)
 
     def _safe_contact_force_norm(self, entity) -> torch.Tensor:
+        if entity is not None:
+            for agent_name, robot in self._robot_entities.items():
+                if robot is entity:
+                    sensor = self._contact_sensors.get(agent_name)
+                    if sensor is not None and hasattr(sensor, "data"):
+                        data = sensor.data
+                        for attr in ("net_forces_w", "net_forces_w_history", "force_matrix_w"):
+                            if not hasattr(data, attr):
+                                continue
+                            tensor = getattr(data, attr)
+                            if not isinstance(tensor, torch.Tensor):
+                                continue
+                            t = tensor.to(device=self._device, dtype=torch.float32)
+                            if t.ndim == 4 and t.shape[0] >= self._num_envs and t.shape[-1] >= 3:
+                                vec = t[: self._num_envs, ...]
+                                norms = torch.linalg.vector_norm(vec, dim=-1)
+                                return torch.amax(norms.reshape(self._num_envs, -1), dim=1)
+                            if t.ndim == 3 and t.shape[0] >= self._num_envs and t.shape[-1] >= 3:
+                                vec = t[: self._num_envs, :, :3]
+                                norms = torch.linalg.vector_norm(vec, dim=-1)
+                                return torch.max(norms, dim=1).values
         if entity is None or not hasattr(entity, "data"):
             return torch.zeros(self._num_envs, dtype=torch.float32, device=self._device)
         data = entity.data
@@ -712,6 +892,18 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             self._attachment_backend.detach(path)
         self._attachment_count_buf[env_ids] = 0
 
+    def _reset_belief_idx(self, env_ids: torch.Tensor) -> None:
+        dims = np.asarray(self.cfg.payload_dims_m, dtype=np.float32)
+        for env_id in env_ids.detach().to(device="cpu", dtype=torch.long).tolist():
+            ekf = BeliefEKF(dt=float(self.cfg.sim.dt) * float(max(1, int(self.cfg.decimation))))
+            ekf.initialize(
+                mass_kg=float(self.cfg.object_mass_nominal_kg),
+                com_offset_xyz=(0.0, 0.0, 0.0),
+                dims_xyz=dims,
+            )
+            self._belief_ekf[int(env_id)] = ekf
+        self._sync_belief_tensors()
+
     def _reset_idx(self, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0:
             return
@@ -724,6 +916,11 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         if self._payload_entity is not None:
             self._reset_rigid_object(self._payload_entity, env_ids)
         self._clear_env_attachments(env_ids)
+        self._reset_belief_idx(env_ids)
+        self._cbf_slack[env_ids] = 0.0
+        self._cbf_applied[env_ids] = False
+        self._neural_barrier[env_ids] = 0.0
+        self._residual_goal_offset[env_ids] = 0.0
         self._phase_mgr.reset(now_s=0.0, env_ids=env_ids.detach().to("cpu").tolist())
 
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
@@ -735,27 +932,123 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 raise ValueError(f"Action tensor for {name} must be [num_envs, {AGENT_ACT_DIM}]")
             self._last_actions[name] = torch.clamp(act, -1.0, 1.0)
 
+    def _cbf_extra_constraint(
+        self,
+        env_id: int,
+        agent_name: str,
+        force_n: float,
+        v_ref: np.ndarray,
+        obj_vel_xy: np.ndarray,
+        normal_xy: np.ndarray,
+    ) -> Optional[tuple[np.ndarray, float, float]]:
+        if self._neural_cbf_runtime is None:
+            return None
+        belief_mu = self._belief_mu[env_id].detach().to(device="cpu", dtype=torch.float32).numpy()
+        belief_cov = np.diag(
+            self._belief_cov_diag[env_id].detach().to(device="cpu", dtype=torch.float32).numpy()
+        ).astype(np.float32)
+        linear = self._neural_cbf_runtime.linearized_velocity_constraint(
+            force_n=force_n,
+            belief_mu=belief_mu,
+            belief_cov=belief_cov,
+            v_ref=v_ref,
+            obj_vel_xy=obj_vel_xy,
+            normal_xy=normal_xy,
+            dt=float(self.cfg.sim.dt) * float(max(1, int(self.cfg.decimation))),
+            force_vel_gain=4.0,
+        )
+        agent_idx = self.possible_agents.index(agent_name)
+        self._neural_barrier[env_id, agent_idx] = float(linear.h_value)
+        coeff = linear.grad_v.astype(np.float64)
+        rhs = float(np.dot(coeff, v_ref.astype(np.float64)) - linear.h_value)
+        return coeff, rhs, float(linear.h_value)
+
+    def _apply_cbf_filter(self, commands: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if not bool(self.cfg.use_cbf):
+            return commands
+        filtered = {name: cmd.clone() for name, cmd in commands.items()}
+        robot_state = {
+            name: self._robot_base_features(self._robot_entities[name]).detach().to(device="cpu", dtype=torch.float32).numpy()
+            for name in self.possible_agents
+        }
+        payload = self._payload_features().detach().to(device="cpu", dtype=torch.float32).numpy()
+        for env_id in range(self._num_envs):
+            obj_vel_xy = payload[env_id, 3:5].astype(np.float64)
+            for agent_idx, name in enumerate(self.possible_agents):
+                me = robot_state[name][env_id]
+                pos_i = me[0:2].astype(np.float64)
+                neighbor_pos = []
+                neighbor_vel = []
+                for other_name in self.possible_agents:
+                    if other_name == name:
+                        continue
+                    ot = robot_state[other_name][env_id]
+                    neighbor_pos.append(ot[0:2].astype(np.float64))
+                    neighbor_vel.append(ot[3:5].astype(np.float64))
+                v_des = filtered[name][env_id, 0:2].detach().to(device="cpu", dtype=torch.float32).numpy().astype(np.float64)
+                normal = payload[env_id, 0:2] - me[0:2]
+                nrm = float(np.linalg.norm(normal))
+                if nrm <= 1.0e-6:
+                    normal = np.array([1.0, 0.0], dtype=np.float64)
+                else:
+                    normal = (normal / nrm).astype(np.float64)
+                extra_linear = []
+                force_t = self._contact_force_cache.get(name)
+                force_n = float(force_t[env_id].item()) if force_t is not None else 0.0
+                extra = self._cbf_extra_constraint(env_id, name, force_n, v_des, obj_vel_xy, normal)
+                if extra is not None:
+                    coeff, rhs, _ = extra
+                    extra_linear.append((coeff, rhs))
+                result = solve_cbf_qp(
+                    v_des=v_des,
+                    pos_i=pos_i,
+                    neighbor_pos=neighbor_pos,
+                    neighbor_vel=neighbor_vel,
+                    v_max=float(self.cfg.speed_limit_mps),
+                    d_min=float(self.cfg.separation_min_m),
+                    alpha=float(self.cfg.cbf_alpha),
+                    slack_weight=float(self.cfg.cbf_slack_weight),
+                    slack_max=float(self.cfg.cbf_slack_max),
+                    extra_linear=extra_linear or None,
+                )
+                filtered[name][env_id, 0:2] = torch.tensor(result.v_safe, dtype=torch.float32, device=self._device)
+                self._cbf_slack[env_id, agent_idx] = float(result.slack)
+                self._cbf_applied[env_id, agent_idx] = bool(
+                    np.linalg.norm(result.v_safe - v_des) > 1.0e-4
+                )
+        return filtered
+
     def _apply_action(self) -> None:
         # Base action mapping:
         # [vx_norm, vy_norm, yaw_norm] -> [m/s, m/s, rad/s], then to wheel rad/s.
         # Arm action mapping:
         # [d_joint1_norm, d_joint2_norm, d_joint3_norm] -> additive joint targets.
-        speed_limit = 0.25
-        yaw_limit = 1.2
+        speed_limit = float(self.cfg.speed_limit_mps)
+        yaw_limit = float(self.cfg.yaw_rate_limit_radps)
         wheel_radius = float(max(self.cfg.wheel_radius_m, 1.0e-4))
         yaw_coupling = float(max(self.cfg.mecanum_yaw_coupling_m, 0.0))
         arm_delta_limit = float(max(self.cfg.arm_delta_limit_rad, 0.0))
+        command_dict: Dict[str, torch.Tensor] = {}
         for name in self.possible_agents:
             act = self._last_actions[name]
             base_act = act[:, :BASE_ACT_DIM]
-            arm_act = act[:, BASE_ACT_DIM : BASE_ACT_DIM + ARM_ACT_DIM]
-
             cmd = torch.empty((self._num_envs, BASE_CMD_DIM), dtype=torch.float32, device=self._device)
             cmd[:, 0] = base_act[:, 0] * speed_limit
             cmd[:, 1] = base_act[:, 1] * speed_limit
             cmd[:, 2] = base_act[:, 2] * yaw_limit
-            self._command_cache[name] = cmd
+            command_dict[name] = cmd
 
+        self._refresh_entity_buffers()
+        self._phase_inputs()
+        self._update_belief_state()
+        self._update_residual_goal_offset()
+        command_dict = self._apply_cbf_filter(command_dict)
+
+        for name in self.possible_agents:
+            act = self._last_actions[name]
+            arm_act = act[:, BASE_ACT_DIM : BASE_ACT_DIM + ARM_ACT_DIM]
+            cmd = command_dict[name]
+            self._command_cache[name] = cmd
             robot = self._robot_entities.get(name)
             if robot is None:
                 continue
@@ -895,17 +1188,111 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         yaw = 2.0 * torch.atan2(q_z, torch.clamp(q_w, min=1e-6))
         return torch.cat([pos_xy, yaw, lin_xy, ang_z], dim=1)  # [N, 6]
 
+    def _update_belief_state(self) -> None:
+        if not bool(self.cfg.use_belief_ekf) or not self._belief_ekf:
+            return
+        payload_xy = self._payload_features()[:, 0:2].detach().to(device="cpu", dtype=torch.float32).numpy()
+        robot_xy = []
+        contact_forces = []
+        for name in self.possible_agents:
+            robot_xy.append(
+                self._robot_base_features(self._robot_entities[name])[:, 0:2]
+                .detach()
+                .to(device="cpu", dtype=torch.float32)
+                .numpy()
+            )
+            force_t = self._contact_force_cache.get(name)
+            if force_t is None:
+                force_t = self._safe_contact_force_norm(self._robot_entities[name])
+            contact_forces.append(force_t.detach().to(device="cpu", dtype=torch.float32).numpy())
+        robot_xy_arr = np.stack(robot_xy, axis=1).astype(np.float32)
+        force_arr = np.stack(contact_forces, axis=1).astype(np.float32)
+        for env_id, ekf in enumerate(self._belief_ekf):
+            ekf.predict()
+            ekf.update(
+                forces_z=force_arr[env_id],
+                robot_positions_xy=robot_xy_arr[env_id],
+                object_center_xy=payload_xy[env_id],
+            )
+        self._sync_belief_tensors()
+
+    def _residual_features(self, env_id: int, agent_idx: int, radial_xy: np.ndarray) -> np.ndarray:
+        radial = np.asarray(radial_xy, dtype=np.float32).reshape(2)
+        norm = float(np.linalg.norm(radial))
+        if norm > 1.0e-6:
+            radial = radial / norm
+        measured_share = 0.0
+        target_share = 1.0 / float(max(1, len(self.possible_agents)))
+        if self.possible_agents:
+            force_t = self._contact_force_cache.get(self.possible_agents[agent_idx])
+            if force_t is not None:
+                total = float(
+                    sum(
+                        torch.clamp(self._contact_force_cache[name][env_id], min=0.0).item()
+                        for name in self.possible_agents
+                    )
+                )
+                if total > 1.0e-6:
+                    measured_share = float(max(0.0, force_t[env_id].item()) / total)
+        delta_share = measured_share - target_share
+        posterior_max = float(np.clip(1.0 - self._belief_uncertainty[env_id, 0].item(), 0.0, 1.0))
+        selected_conf = posterior_max
+        payload_norm = float(np.clip(self.cfg.object_mass_nominal_kg / 280.0, 0.0, 1.5))
+        mass_norm = float(np.clip(self._belief_mu[env_id, 0].item() / 280.0, 0.0, 2.0))
+        dims = np.asarray(self.cfg.payload_dims_m, dtype=np.float32)
+        dim_l = float(np.clip(dims[0] / 2.0, 0.0, 2.0))
+        dim_w = float(np.clip(dims[1] / 2.0, 0.0, 2.0))
+        dim_h = float(np.clip(dims[2], 0.0, 2.0))
+        return np.array(
+            [
+                measured_share,
+                target_share,
+                delta_share,
+                posterior_max,
+                selected_conf,
+                payload_norm,
+                1.0 if self.cfg.object_mass_nominal_kg >= 150.0 else 0.0,
+                mass_norm,
+                dim_l,
+                dim_w,
+                dim_h,
+                float(self._belief_uncertainty[env_id, 0].item()),
+                float(radial[0]),
+                float(radial[1]),
+            ],
+            dtype=np.float32,
+        )
+
+    def _update_residual_goal_offset(self) -> None:
+        offsets = torch.zeros((self._num_envs, 2), dtype=torch.float32, device=self._device)
+        payload_xy = self._payload_features()[:, 0:2].detach().to(device="cpu", dtype=torch.float32).numpy()
+        goal_xy = self._goal_xy.detach().to(device="cpu", dtype=torch.float32).numpy()
+        if self._residual_runtime is None:
+            self._residual_goal_offset = offsets
+            return
+        if len(RESIDUAL_FEATURE_NAMES) != 14:
+            self._residual_goal_offset = offsets
+            return
+        for env_id in range(self._num_envs):
+            radial = goal_xy[env_id] - payload_xy[env_id]
+            feat = self._residual_features(env_id, agent_idx=0, radial_xy=radial)
+            pred = self._residual_runtime.predict(feat)
+            offsets[env_id, 0] = float(np.clip(pred.dx, -self.cfg.residual_max_offset_m, self.cfg.residual_max_offset_m))
+            offsets[env_id, 1] = float(np.clip(pred.dy, -self.cfg.residual_max_offset_m, self.cfg.residual_max_offset_m))
+        self._residual_goal_offset = offsets
+
     def _agent_obs(self, agent_name: str, agent_idx: int) -> torch.Tensor:
         robot = self._robot_entities[agent_name]
         ego = self._robot_base_features(robot)  # [N, 6]
         payload = self._payload_features()  # [N, 6]
         rel_payload = payload - ego  # [N, 6]
 
+        adjusted_goal_xy = self._goal_xy + self._residual_goal_offset
         goal = torch.zeros((self._num_envs, 6), dtype=torch.float32, device=self._device)
-        goal[:, 0:2] = self._goal_xy
-        goal[:, 2] = 0.0
-        goal[:, 3:5] = self._goal_xy - ego[:, 0:2]
-        goal[:, 5] = 0.0
+        goal[:, 0:2] = adjusted_goal_xy
+        goal[:, 2] = self._belief_uncertainty[:, 0]
+        goal[:, 3:5] = adjusted_goal_xy - ego[:, 0:2]
+        goal[:, 5] = self._belief_uncertainty[:, 1]
 
         neighbor_blocks = []
         for j, name_j in enumerate(self.possible_agents):
@@ -936,6 +1323,9 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
 
     def _get_states(self) -> torch.Tensor:
         self._refresh_entity_buffers()
+        self._phase_inputs()
+        self._update_belief_state()
+        self._update_residual_goal_offset()
         # Explicit centralized critic input (do not rely on implicit concatenation fallback).
         per_agent_obs = [self._agent_obs(name, i) for i, name in enumerate(self.possible_agents)]
         obs_cat = torch.cat(per_agent_obs, dim=1)  # [N, 244] for 4x61
@@ -949,7 +1339,14 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         global_block[:, 0:6] = payload
         global_block[:, 6:16] = phase
         global_block[:, 16:17] = time_s
-        global_block[:, 17:19] = self._goal_xy
+        global_block[:, 17:19] = self._goal_xy + self._residual_goal_offset
+        global_block[:, 19:26] = self._belief_mu
+        global_block[:, 26:33] = self._belief_cov_diag
+        global_block[:, 33:35] = self._belief_uncertainty
+        global_block[:, 35:39] = self._cbf_slack[:, :4]
+        global_block[:, 39:43] = self._cbf_applied[:, :4].to(dtype=torch.float32)
+        global_block[:, 43:47] = self._neural_barrier[:, :4]
+        global_block[:, 47:49] = self._residual_goal_offset
 
         state = torch.cat([obs_cat, global_block], dim=1).to(dtype=torch.float32)
         target_dim = int(self.cfg.state_space)
@@ -969,15 +1366,19 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
         self._refresh_entity_buffers()
         phase_inputs = self._phase_inputs()
+        self._update_belief_state()
+        self._update_residual_goal_offset()
         self._phase_mgr.update(phase_inputs, now_s=self._episode_time_seconds())
         payload_xy = self._payload_features()[:, 0:2]
-        goal_dist = torch.linalg.vector_norm(payload_xy - self._goal_xy, dim=1)
+        adjusted_goal_xy = self._goal_xy + self._residual_goal_offset
+        goal_dist = torch.linalg.vector_norm(payload_xy - adjusted_goal_xy, dim=1)
         goal_bonus = 0.02 * (1.0 - torch.tanh(goal_dist))
 
         team_attach_bonus = 0.01 * phase_inputs.all_attached.to(dtype=torch.float32)
         rewards: Dict[str, torch.Tensor] = {}
         overload_limit = float(self.cfg.contact_force_overload_n)
         for name in self.possible_agents:
+            agent_idx = self.possible_agents.index(name)
             act = self._last_actions[name]
             control_pen = 0.001 * torch.sum(act**2, dim=1)
             force_n = self._contact_force_cache.get(name)
@@ -985,17 +1386,23 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 force_n = self._safe_contact_force_norm(self._robot_entities[name])
             contact_bonus = 0.004 * (force_n >= float(self.cfg.contact_force_threshold_n)).to(dtype=torch.float32)
             overload_pen = 0.002 * torch.relu(force_n - overload_limit)
+            cbf_pen = 0.002 * self._cbf_slack[:, agent_idx]
+            intervention_pen = 0.001 * self._cbf_applied[:, agent_idx].to(dtype=torch.float32)
+            belief_bonus = 0.002 * (1.0 - torch.tanh(self._belief_uncertainty[:, 0]))
             rewards[name] = (
                 -0.01
                 - control_pen
                 - overload_pen
+                - cbf_pen
+                - intervention_pen
                 + contact_bonus
                 + team_attach_bonus
                 + goal_bonus
+                + belief_bonus
             ).to(dtype=torch.float32)
         return rewards
 
-    def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_dones(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         done_phase_id = int(PHASE_TO_ID[Phase.DONE])
         terminated = self._phase_mgr.phase_ids == done_phase_id
         if hasattr(self, "episode_length_buf") and hasattr(self, "max_episode_length"):
@@ -1003,7 +1410,9 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             truncated = truncated.to(device=self._device, dtype=torch.bool)
         else:
             truncated = self._episode_time_seconds() >= float(self.cfg.episode_length_s)
-        return terminated, truncated
+        terminated_dict = {name: terminated for name in self.possible_agents}
+        truncated_dict = {name: truncated for name in self.possible_agents}
+        return terminated_dict, truncated_dict
 
     def _attachment_prim_path(self, env_id: int, agent_name: str) -> str:
         return f"/World/envs/env_{int(env_id)}/Attachments/{agent_name}"

@@ -1,6 +1,6 @@
 # Isaac Lab Port (No-VLM)
 
-This folder is the starting point for migrating from the PyBullet pipeline to Isaac Lab.
+This folder is the active Isaac-only path for the project. PyBullet is not part of the intended runtime here.
 
 ## Scope of this scaffold
 
@@ -25,6 +25,22 @@ This folder is the starting point for migrating from the PyBullet pipeline to Is
 
 - Isaac Lab `v2.3.2`
 - Isaac Sim `5.1`
+
+## Local workstation setup
+
+For this repo-local workstation flow, use:
+
+```bash
+bash isaac_lab_port/setup_local_isaac.sh
+```
+
+This creates a conda env under `./.conda_envs/` and checks out IsaacLab under `./third_party/`.
+
+Project-side Python extras for the Isaac path live in:
+
+```bash
+isaac_lab_port/requirements_isaac_extra.txt
+```
 
 ## First command to run locally
 

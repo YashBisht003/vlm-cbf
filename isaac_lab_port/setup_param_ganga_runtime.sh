@@ -9,6 +9,7 @@ Usage:
 
 Options:
   --env-name NAME          Conda env name (default: isaaclab_232)
+  --env-prefix PATH        Conda env prefix path (default: PROJECT_DIR/.conda_envs/ENV_NAME)
   --isaaclab-dir PATH      Isaac Lab source directory (default: $HOME/IsaacLab)
   --project-dir PATH       Project repo root (default: current working directory)
   --python-version VER     Python version for conda env (default: 3.11)
@@ -19,12 +20,14 @@ Options:
 Notes:
   - Intended for Linux GPU nodes (Param Ganga).
   - Installs Isaac Sim 5.1 and Isaac Lab v2.3.2 from source.
+  - Defaults keep all writable artifacts inside PROJECT_DIR.
 EOF
 }
 
 ENV_NAME="isaaclab_232"
-ISAACLAB_DIR="${HOME}/IsaacLab"
+ENV_PREFIX=""
 PROJECT_DIR="$(pwd)"
+ISAACLAB_DIR="${PROJECT_DIR}/third_party/IsaacLab"
 PYTHON_VERSION="3.11"
 SKIP_SMOKE=0
 SKIP_ISAACSIM=0
@@ -33,6 +36,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --env-name)
       ENV_NAME="$2"
+      shift 2
+      ;;
+    --env-prefix)
+      ENV_PREFIX="$2"
       shift 2
       ;;
     --isaaclab-dir)
@@ -83,6 +90,8 @@ if ! command -v conda >/dev/null 2>&1; then
   exit 2
 fi
 
+export QT_XCB_GL_INTEGRATION="${QT_XCB_GL_INTEGRATION-}"
+
 echo ">>> Host: $(hostname)"
 echo ">>> Date: $(date)"
 echo ">>> GPU:"
@@ -105,14 +114,24 @@ print(">>> GLIBC check passed (>= 2.35)")
 PY
 
 # Activate conda shell functions.
+set +u
 eval "$(conda shell.bash hook)"
+set -u
 
-if ! conda env list | awk '{print $1}' | grep -qx "${ENV_NAME}"; then
-  echo ">>> Creating conda env: ${ENV_NAME} (python=${PYTHON_VERSION})"
-  conda create -y -n "${ENV_NAME}" "python=${PYTHON_VERSION}"
+if [[ -z "${ENV_PREFIX}" ]]; then
+  ENV_PREFIX="${PROJECT_DIR}/.conda_envs/${ENV_NAME}"
 fi
 
-conda activate "${ENV_NAME}"
+mkdir -p "$(dirname "${ENV_PREFIX}")"
+
+if [[ ! -x "${ENV_PREFIX}/bin/python" ]]; then
+  echo ">>> Creating project-local conda env: ${ENV_PREFIX} (python=${PYTHON_VERSION})"
+  conda create -y -p "${ENV_PREFIX}" "python=${PYTHON_VERSION}"
+fi
+
+set +u
+conda activate "${ENV_PREFIX}"
+set -u
 PY_BIN="$(command -v python)"
 echo ">>> Python: ${PY_BIN}"
 python -V
@@ -134,13 +153,13 @@ else
 fi
 
 if [[ ! -d "${ISAACLAB_DIR}/.git" ]]; then
-  echo ">>> Cloning IsaacLab into ${ISAACLAB_DIR}"
-  git clone https://github.com/isaac-sim/IsaacLab.git "${ISAACLAB_DIR}"
+  echo ">>> Shallow-cloning IsaacLab v2.3.2 into ${ISAACLAB_DIR}"
+  git clone --branch v2.3.2 --depth 1 https://github.com/isaac-sim/IsaacLab.git "${ISAACLAB_DIR}"
 fi
 
 cd "${ISAACLAB_DIR}"
 echo ">>> Checking out IsaacLab v2.3.2"
-git fetch --all --tags
+git fetch --depth 1 origin tag v2.3.2 || true
 git checkout v2.3.2
 git submodule update --init --recursive
 
@@ -172,6 +191,7 @@ cd "${PROJECT_DIR}"
 echo ">>> Project dir: ${PROJECT_DIR}"
 
 export ISAACLAB_PATH="${ISAACLAB_DIR}"
+export CONDA_DEFAULT_ENV="${ENV_PREFIX}"
 echo ">>> Checking official SKRL train.py for known --algorithm bug"
 python isaac_lab_port/check_skrl_train_script.py
 
@@ -192,4 +212,4 @@ else
 fi
 
 echo ">>> Setup completed successfully at $(date)"
-echo ">>> Activate later with: conda activate ${ENV_NAME}"
+echo ">>> Activate later with: conda activate ${ENV_PREFIX}"

@@ -60,6 +60,12 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Isaac Lab official SKRL training script via isaaclab.sh if available.",
     )
+    parser.add_argument(
+        "--smoke-ekf-debug-steps",
+        type=int,
+        default=10,
+        help="Number of early env steps to print EKF/CBF debug diagnostics for in smoke mode.",
+    )
     return parser.parse_args()
 
 
@@ -277,8 +283,8 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
         _force_contact_probe_pose(raw_env)
     state = wrapped.state()
     first_agent = next(iter(obs.keys()))
-    print(f"[smoke] policy obs shape ({first_agent}): {tuple(obs[first_agent].shape)}")
-    print(f"[smoke] value state shape: {tuple(state.shape)}")
+    print(f"[smoke] policy obs shape ({first_agent}): {tuple(obs[first_agent].shape)}", flush=True)
+    print(f"[smoke] value state shape: {tuple(state.shape)}", flush=True)
 
     nonzero_seen = False
     max_force_seen = 0.0
@@ -308,14 +314,14 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
                         stats["nonzero"],
                         stats["total"],
                     )
-                )
+                , flush=True)
     elapsed = time.time() - t0
-    print(f"[smoke] finished in {elapsed:.2f}s")
-    print(f"[smoke] contact non-zero seen: {nonzero_seen} (max={max_force_seen:.6f})")
+    print(f"[smoke] finished in {elapsed:.2f}s", flush=True)
+    print(f"[smoke] contact non-zero seen: {nonzero_seen} (max={max_force_seen:.6f})", flush=True)
     if not nonzero_seen:
         print(
             "[smoke][warn] contact forces remained zero. Verify USD contact setup and wheel/contact sensor configuration."
-        )
+        , flush=True)
         if args.smoke_require_contact:
             raise RuntimeError(
                 "Smoke test failed: no non-zero contact force observed. "
@@ -325,6 +331,10 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True, write_through=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True, write_through=True)
 
     try:
         from .check_skrl_train_script import check_script
@@ -354,7 +364,7 @@ def main() -> None:
         "official_train_command": " ".join(official_cmd + (["--headless"] if args.headless else [])),
         "cwd": str(Path.cwd()),
     }
-    print(json.dumps(payload, indent=2))
+    print(json.dumps(payload, indent=2), flush=True)
 
     if args.print_only:
         return
@@ -375,11 +385,11 @@ def main() -> None:
     sim_app = None
     try:
         _launcher, sim_app = _launch_app(headless=bool(args.headless))
-        print("[bootstrap] AppLauncher started.")
+        print("[bootstrap] AppLauncher started.", flush=True)
         import gymnasium as gym
         from isaaclab_rl.skrl import SkrlVecEnvWrapper
         registration_summary(force=True)
-        print("[bootstrap] Imported gymnasium and SkrlVecEnvWrapper.")
+        print("[bootstrap] Imported gymnasium and SkrlVecEnvWrapper.", flush=True)
     except Exception as exc:
         raise RuntimeError(
             "Failed to import Isaac Lab SKRL runtime modules. "
@@ -388,20 +398,26 @@ def main() -> None:
 
     try:
         env_cfg = _build_env_cfg(num_envs=int(args.num_envs))
-        print(f"[bootstrap] Built env cfg for {int(args.num_envs)} envs.")
+        if args.smoke_test:
+            env_cfg.debug_belief_steps = max(0, int(args.smoke_ekf_debug_steps))
+            env_cfg.debug_cbf_steps = max(0, int(args.smoke_ekf_debug_steps))
+        print(f"[bootstrap] Built env cfg for {int(args.num_envs)} envs.", flush=True)
         try:
             env = gym.make(TASK_ID, cfg=env_cfg)
-            print("[bootstrap] gym.make succeeded.")
+            print("[bootstrap] gym.make succeeded.", flush=True)
             wrapped = SkrlVecEnvWrapper(env, ml_framework="torch", wrapper="isaaclab-multi-agent")
             try:
-                print(f"[ok] Loaded task '{TASK_ID}' via gym.make and wrapped env as {type(wrapped).__name__}.")
+                print(
+                    f"[ok] Loaded task '{TASK_ID}' via gym.make and wrapped env as {type(wrapped).__name__}.",
+                    flush=True,
+                )
                 if args.smoke_test:
                     raw_env = getattr(wrapped, "_unwrapped", env)
                     _run_smoke_test(wrapped, raw_env, args)
             finally:
                 wrapped.close()
         except BaseException as exc:
-            print(f"[bootstrap] env pipeline exception: {type(exc).__name__}: {exc}")
+            print(f"[bootstrap] env pipeline exception: {type(exc).__name__}: {exc}", flush=True)
             traceback.print_exc()
             raise
     finally:

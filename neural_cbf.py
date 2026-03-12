@@ -163,9 +163,16 @@ def neural_cbf_loss(h_values: torch.Tensor, safe_labels: torch.Tensor, margin: f
     - safe samples (label=1) should satisfy h >= +margin
     - unsafe samples (label=0) should satisfy h <= -margin
     """
-    safe_labels = safe_labels.float()
-    targets = (safe_labels * 2.0 - 1.0) * float(margin)
-    return F.relu(targets - h_values).pow(2).mean()
+    safe_mask = safe_labels.bool()
+    losses = []
+    if bool(torch.any(safe_mask)):
+        losses.append(F.relu(float(margin) - h_values[safe_mask]).pow(2).mean())
+    unsafe_mask = ~safe_mask
+    if bool(torch.any(unsafe_mask)):
+        losses.append(F.relu(h_values[unsafe_mask] + float(margin)).pow(2).mean())
+    if not losses:
+        return h_values.sum() * 0.0
+    return torch.stack(losses).mean()
 
 
 def neural_cbf_temporal_loss(

@@ -479,6 +479,13 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
     cbf_alpha: float = 2.0
     cbf_slack_weight: float = 100.0
     cbf_slack_max: float = 3.0
+    cbf_slack_threshold: float = 0.25
+    cbf_recovery_gain: float = 0.5
+    cbf_enable_after_s: float = 0.0
+    cbf_warmup_s: float = 2.0
+    cbf_dmin_com_gain: float = 1.0
+    cbf_alpha_mass_gain: float = 2.0
+    cbf_speed_mass_gain: float = 1.0
     use_cbf: bool = True
     use_belief_ekf: bool = True
     use_neural_cbf: bool = False
@@ -960,8 +967,21 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         agent_idx = self.possible_agents.index(agent_name)
         self._neural_barrier[env_id, agent_idx] = float(linear.h_value)
         coeff = linear.grad_v.astype(np.float64)
+        if float(np.linalg.norm(coeff)) <= 1.0e-6:
+            return None
         rhs = float(np.dot(coeff, v_ref.astype(np.float64)) - linear.h_value)
         return coeff, rhs, float(linear.h_value)
+
+    def _cbf_activation_scale(self, env_id: int) -> float:
+        step_dt = float(self.cfg.sim.dt) * float(max(1, int(self.cfg.decimation)))
+        elapsed_s = float(self.episode_length_buf[env_id].item()) * step_dt
+        enable_after = max(0.0, float(self.cfg.cbf_enable_after_s))
+        warmup = max(0.0, float(self.cfg.cbf_warmup_s))
+        if elapsed_s <= enable_after:
+            return 0.0
+        if warmup <= 1.0e-6:
+            return 1.0
+        return float(np.clip((elapsed_s - enable_after) / warmup, 0.0, 1.0))
 
     def _apply_cbf_filter(self, commands: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if not bool(self.cfg.use_cbf):
@@ -972,9 +992,15 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             for name in self.possible_agents
         }
         payload = self._payload_features().detach().to(device="cpu", dtype=torch.float32).numpy()
+        belief_unc = self._belief_uncertainty.detach().to(device="cpu", dtype=torch.float32).numpy()
         for env_id in range(self._num_envs):
+            activation = self._cbf_activation_scale(env_id)
             obj_vel_xy = payload[env_id, 3:5].astype(np.float64)
             for agent_idx, name in enumerate(self.possible_agents):
+                if activation <= 0.0:
+                    self._cbf_slack[env_id, agent_idx] = 0.0
+                    self._cbf_applied[env_id, agent_idx] = False
+                    continue
                 me = robot_state[name][env_id]
                 pos_i = me[0:2].astype(np.float64)
                 neighbor_pos = []
@@ -999,22 +1025,39 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 if extra is not None:
                     coeff, rhs, _ = extra
                     extra_linear.append((coeff, rhs))
+                com_u = float(belief_unc[env_id, 0]) if belief_unc.size else 0.0
+                mass_rel = float(belief_unc[env_id, 1]) if belief_unc.size else 0.0
+                d_min_target = float(self.cfg.separation_min_m) + float(self.cfg.cbf_dmin_com_gain) * com_u
+                d_min_eff = max(1.0e-4, activation * d_min_target)
+                alpha_target = float(self.cfg.cbf_alpha) / max(
+                    1.0, 1.0 + float(self.cfg.cbf_alpha_mass_gain) * mass_rel
+                )
+                alpha_eff = max(1.0e-4, activation * alpha_target)
+                v_max_target = float(self.cfg.speed_limit_mps) / max(
+                    1.0, 1.0 + float(self.cfg.cbf_speed_mass_gain) * mass_rel
+                )
+                v_max_eff = (1.0 - activation) * float(self.cfg.speed_limit_mps) + activation * v_max_target
                 result = solve_cbf_qp(
                     v_des=v_des,
                     pos_i=pos_i,
                     neighbor_pos=neighbor_pos,
                     neighbor_vel=neighbor_vel,
-                    v_max=float(self.cfg.speed_limit_mps),
-                    d_min=float(self.cfg.separation_min_m),
-                    alpha=float(self.cfg.cbf_alpha),
+                    v_max=float(v_max_eff),
+                    d_min=float(d_min_eff),
+                    alpha=float(alpha_eff),
                     slack_weight=float(self.cfg.cbf_slack_weight),
                     slack_max=float(self.cfg.cbf_slack_max),
+                    slack_threshold=float(self.cfg.cbf_slack_threshold),
+                    recovery_gain=float(self.cfg.cbf_recovery_gain),
                     extra_linear=extra_linear or None,
                 )
-                filtered[name][env_id, 0:2] = torch.tensor(result.v_safe, dtype=torch.float32, device=self._device)
+                v_safe = np.asarray(result.v_safe, dtype=np.float64)
+                if result.slack_exceeded:
+                    v_safe = np.zeros(2, dtype=np.float64)
+                filtered[name][env_id, 0:2] = torch.tensor(v_safe, dtype=torch.float32, device=self._device)
                 self._cbf_slack[env_id, agent_idx] = float(result.slack)
                 self._cbf_applied[env_id, agent_idx] = bool(
-                    np.linalg.norm(result.v_safe - v_des) > 1.0e-4
+                    np.linalg.norm(v_safe - v_des) > 1.0e-4
                 )
         return filtered
 

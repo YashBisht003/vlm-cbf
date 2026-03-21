@@ -29,7 +29,7 @@ class AutoAttachmentBackend:
             from pxr import PhysxSchema  # noqa: F401
         except Exception:
             return False
-        return True
+        return self._physx_attachment_iface is not None
 
     def attach(self, attachment_prim_path: str, parent_rigid_body_path: str, child_rigid_body_path: str) -> str:
         if not self.cfg.enabled:
@@ -50,8 +50,12 @@ class AutoAttachmentBackend:
         attachment.CreateActor0Rel().SetTargets([Sdf.Path(parent_rigid_body_path)])
         attachment.CreateActor1Rel().SetTargets([Sdf.Path(child_rigid_body_path)])
 
-        if self._physx_attachment_iface is not None:
-            self._physx_attachment_iface.compute_attachment_points(attachment_prim_path)
+        if self._physx_attachment_iface is None:
+            raise RuntimeError(
+                "PhysX attachment interface is unavailable. "
+                "Refusing to create an attachment prim without computed attachment points."
+            )
+        self._physx_attachment_iface.compute_attachment_points(attachment_prim_path)
         return attachment_prim_path
 
     def detach(self, attachment_prim_path: str) -> None:
@@ -66,4 +70,3 @@ class AutoAttachmentBackend:
         if stage is None:
             return
         stage.RemovePrim(Sdf.Path(attachment_prim_path))
-

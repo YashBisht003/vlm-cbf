@@ -130,6 +130,21 @@ def _random_actions(wrapped):
     return actions
 
 
+def _pack_agent_action(cmd_xy, yaw, arm, grip, act_dim: int):
+    import torch
+
+    if grip.ndim == 1:
+        grip = grip.view(-1, 1)
+    parts = [cmd_xy, yaw, arm]
+    if act_dim >= 7:
+        parts.append(grip)
+    action = torch.cat(parts, dim=1).to(dtype=torch.float32)
+    if action.shape[1] < act_dim:
+        pad = torch.zeros((action.shape[0], act_dim - action.shape[1]), dtype=action.dtype, device=action.device)
+        action = torch.cat([action, pad], dim=1)
+    return action[:, :act_dim]
+
+
 def _scripted_approach_actions(wrapped, raw_env):
     import torch
 
@@ -141,7 +156,9 @@ def _scripted_approach_actions(wrapped, raw_env):
         cmd_xy = torch.clamp(delta * 2.0, min=-1.0, max=1.0)
         yaw = torch.zeros((wrapped.num_envs, 1), dtype=torch.float32, device=wrapped.device)
         arm = torch.zeros((wrapped.num_envs, 3), dtype=torch.float32, device=wrapped.device)
-        actions[agent_name] = torch.cat([cmd_xy, yaw, arm], dim=1).to(dtype=torch.float32)
+        grip = torch.ones((wrapped.num_envs, 1), dtype=torch.float32, device=wrapped.device)
+        act_dim = int(wrapped.action_spaces[agent_name].shape[0])
+        actions[agent_name] = _pack_agent_action(cmd_xy, yaw, arm, grip, act_dim)
     return actions
 
 
@@ -180,7 +197,9 @@ def _scripted_contact_hold_actions(wrapped, raw_env):
         cmd_xy = torch.clamp(vel_cmd / max(speed_limit, 1.0e-6), min=-1.0, max=1.0)
         yaw = torch.zeros((wrapped.num_envs, 1), dtype=torch.float32, device=wrapped.device)
         arm = torch.zeros((wrapped.num_envs, 3), dtype=torch.float32, device=wrapped.device)
-        actions[agent_name] = torch.cat([cmd_xy, yaw, arm], dim=1).to(dtype=torch.float32)
+        grip = torch.ones((wrapped.num_envs, 1), dtype=torch.float32, device=wrapped.device)
+        act_dim = int(wrapped.action_spaces[agent_name].shape[0])
+        actions[agent_name] = _pack_agent_action(cmd_xy, yaw, arm, grip, act_dim)
     return actions
 
 
@@ -226,7 +245,9 @@ def _scripted_phase_policy_actions(wrapped, raw_env):
         cmd_xy = torch.clamp(vel_cmd / max(speed_limit, 1.0e-6), min=-1.0, max=1.0)
         yaw = torch.zeros((wrapped.num_envs, 1), dtype=torch.float32, device=wrapped.device)
         arm = torch.zeros((wrapped.num_envs, 3), dtype=torch.float32, device=wrapped.device)
-        actions[agent_name] = torch.cat([cmd_xy, yaw, arm], dim=1).to(dtype=torch.float32)
+        grip = torch.ones((wrapped.num_envs, 1), dtype=torch.float32, device=wrapped.device)
+        act_dim = int(wrapped.action_spaces[agent_name].shape[0])
+        actions[agent_name] = _pack_agent_action(cmd_xy, yaw, arm, grip, act_dim)
     return actions
 
 

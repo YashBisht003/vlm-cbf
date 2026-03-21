@@ -198,20 +198,27 @@ class TorchBatchedNoVlmPhaseManager:
         now_vec = self._as_now_vector(now_s)
         inp.validate(self.num_envs, self.device)
 
-        pid = self.phase_ids
+        phase_ids0 = self.phase_ids.clone()
+        phase_started_at_s0 = self.phase_started_at_s.clone()
+        transitioned = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
 
-        self._set_phase(
-            (pid == int(PHASE_TO_ID[Phase.APPROACH])) & inp.approach_ready,
+        def apply_transition(mask: torch.Tensor, phase: Phase) -> None:
+            mask = mask & (~transitioned)
+            if not torch.any(mask):
+                return
+            self._set_phase(mask, phase, now_vec)
+            transitioned[mask] = True
+
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.APPROACH])) & inp.approach_ready,
             Phase.FINE_APPROACH,
-            now_vec,
         )
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.FINE_APPROACH])) & inp.fine_approach_ready,
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.FINE_APPROACH])) & inp.fine_approach_ready,
             Phase.CONTACT,
-            now_vec,
         )
 
-        in_contact = self.phase_ids == int(PHASE_TO_ID[Phase.CONTACT])
+        in_contact = phase_ids0 == int(PHASE_TO_ID[Phase.CONTACT])
         attached = in_contact & inp.all_attached
         not_started = self.contact_all_attached_since_s < 0.0
         newly_attached = attached & not_started
@@ -223,54 +230,44 @@ class TorchBatchedNoVlmPhaseManager:
         hold_s = float(max(0.0, self.cfg.contact_hold_s))
         attached_since = self.contact_all_attached_since_s
         held_long_enough = attached & (attached_since >= 0.0) & ((now_vec - attached_since) >= hold_s)
-        self._set_phase(held_long_enough, self._post_contact_phase(), now_vec)
+        apply_transition(held_long_enough, self._post_contact_phase())
 
-        elapsed = now_vec - self.phase_started_at_s
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.CONTACT]))
+        elapsed = now_vec - phase_started_at_s0
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.CONTACT]))
             & (elapsed >= float(max(0.0, self.cfg.contact_timeout_s))),
             Phase.APPROACH,
-            now_vec,
         )
 
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.PROBE])) & inp.probe_done,
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.PROBE])) & inp.probe_done,
             self._post_probe_phase(),
-            now_vec,
         )
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.CORRECT])) & inp.correct_done,
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.CORRECT])) & inp.correct_done,
             self._post_correct_phase(),
-            now_vec,
         )
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.REGRIP])) & inp.regrip_done,
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.REGRIP])) & inp.regrip_done,
             Phase.LIFT,
-            now_vec,
         )
 
-        elapsed = now_vec - self.phase_started_at_s
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.REGRIP]))
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.REGRIP]))
             & (elapsed >= float(max(0.0, self.cfg.regrip_timeout_s))),
             Phase.CONTACT,
-            now_vec,
         )
 
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.LIFT])) & inp.lift_done,
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.LIFT])) & inp.lift_done,
             Phase.TRANSPORT,
-            now_vec,
         )
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.TRANSPORT])) & inp.transport_done,
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.TRANSPORT])) & inp.transport_done,
             Phase.PLACE,
-            now_vec,
         )
-        self._set_phase(
-            (self.phase_ids == int(PHASE_TO_ID[Phase.PLACE])) & inp.place_done,
+        apply_transition(
+            (phase_ids0 == int(PHASE_TO_ID[Phase.PLACE])) & inp.place_done,
             Phase.DONE,
-            now_vec,
         )
         return self.phase_ids.clone()
-

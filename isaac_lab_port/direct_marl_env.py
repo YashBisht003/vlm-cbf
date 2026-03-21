@@ -225,11 +225,12 @@ except ImportError:
 
 BASE_ACT_DIM = 3
 ARM_ACT_DIM = 3
+GRIP_ACT_DIM = 1
 BASE_CMD_DIM = 3
-AGENT_ACT_DIM = BASE_ACT_DIM + ARM_ACT_DIM
-AGENT_OBS_DIM = 61
+AGENT_ACT_DIM = BASE_ACT_DIM + ARM_ACT_DIM + GRIP_ACT_DIM
+AGENT_OBS_DIM = 65
 # Centralized critic state = concat(4 * per-agent obs) + global block.
-# With current features: 4*61 + 72 = 316.
+# With current features: 4*65 + 72 = 332.
 CENTRAL_STATE_DIM = AGENT_OBS_DIM * 4 + 72
 ENV_REGEX_NS = "{ENV_REGEX_NS}"
 
@@ -490,6 +491,13 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
     cbf_speed_mass_gain: float = 1.0
     belief_force_ema_alpha: float = 0.25
     belief_min_contact_robots: int = 2
+    probe_hold_s: float = 0.25
+    probe_belief_com_threshold_m: float = 0.03
+    probe_belief_mass_rel_threshold: float = 0.05
+    grip_attach_threshold: float = 0.25
+    grip_release_threshold: float = -0.25
+    grip_contact_force_threshold_n: float = 10.0
+    regrip_balance_std_n: float = 15.0
     debug_belief_steps: int = 0
     debug_belief_log_every: int = 1
     debug_belief_env: int = 0
@@ -556,10 +564,11 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         }
         self._phase_mgr = TorchBatchedNoVlmPhaseManager(
             num_envs=self._num_envs,
-            cfg=PhaseConfig(),
+            cfg=PhaseConfig(include_correct_phase=False),
             device=self._device,
         )
         self._attachment_backend = AutoAttachmentBackend()
+        self._attachment_runtime_available = bool(self._attachment_backend.is_available())
         self._attachments: dict[tuple[int, str], str] = {}
         self._attachment_count_buf = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
         self._robot_entities: dict[str, Articulation] = {}
@@ -1299,6 +1308,8 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             if hasattr(robot, "write_data_to_sim"):
                 robot.write_data_to_sim()
 
+        self._process_grip_actions()
+
     def _phase_inputs(self) -> TorchBatchedPhaseInputs:
         distance_by_agent = self._robot_payload_distances()
         contact_by_agent = {
@@ -1314,7 +1325,10 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         attachment_count = self._attachment_counts()
         all_by_contact = contact_count >= int(self.cfg.num_robots)
         all_by_attachment = attachment_count >= int(self.cfg.num_robots)
-        all_attached = all_by_contact | all_by_attachment
+        if self._attachment_runtime_available:
+            all_attached = all_by_attachment
+        else:
+            all_attached = all_by_contact | all_by_attachment
         self._all_attached_mask = all_attached
         self._base_contact_force_n = torch.mean(contact_forces, dim=1)
 
@@ -1326,9 +1340,25 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         approach_ready = torch.all(distances <= float(self.cfg.approach_radius_m), dim=1)
         fine_approach_ready = torch.all(distances <= float(self.cfg.fine_approach_radius_m), dim=1)
         balance_ok = torch.std(contact_forces, dim=1, unbiased=False) <= float(self.cfg.contact_force_balance_std_n)
-        probe_done = all_attached & balance_ok
-        correct_done = probe_done
-        regrip_done = all_attached
+        now_s = self._episode_time_seconds()
+        probe_elapsed_s = now_s - self._phase_mgr.phase_started_at_s
+        probe_phase_id = int(PHASE_TO_ID[Phase.PROBE])
+        in_probe = self._phase_mgr.phase_ids == probe_phase_id
+        belief_ok = (
+            (self._belief_uncertainty[:, 0] <= float(self.cfg.probe_belief_com_threshold_m))
+            & (self._belief_uncertainty[:, 1] <= float(self.cfg.probe_belief_mass_rel_threshold))
+        )
+        probe_done = (
+            in_probe
+            & all_attached
+            & balance_ok
+            & belief_ok
+            & (probe_elapsed_s >= float(max(0.0, self.cfg.probe_hold_s)))
+        )
+        correct_done = torch.zeros_like(probe_done, dtype=torch.bool)
+        regrip_done = all_attached & (
+            torch.std(contact_forces, dim=1, unbiased=False) <= float(self.cfg.regrip_balance_std_n)
+        )
         lift_done = payload_z >= float(self.cfg.lift_height_m)
         transport_done = lift_done & (goal_dist <= float(self.cfg.goal_tolerance_m))
         place_done = transport_done & (payload_z <= float(self.cfg.place_height_m))
@@ -1394,6 +1424,70 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         q_z = quat[:, 3:4]
         yaw = 2.0 * torch.atan2(q_z, torch.clamp(q_w, min=1e-6))
         return torch.cat([pos_xy, yaw, lin_xy, ang_z], dim=1)  # [N, 6]
+
+    def _attachment_mask_for_agent(self, agent_name: str) -> torch.Tensor:
+        mask = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
+        for env_id in range(self._num_envs):
+            if (int(env_id), str(agent_name)) in self._attachments:
+                mask[env_id] = True
+        return mask
+
+    def _attachment_count_fraction(self) -> torch.Tensor:
+        return torch.clamp(
+            self._attachment_count_buf.to(dtype=torch.float32) / float(max(1, self.cfg.num_robots)),
+            0.0,
+            1.0,
+        )
+
+    def _robot_hand_prim_path(self, env_id: int, agent_name: str) -> str:
+        agent_idx = int(str(agent_name).split("_")[-1])
+        return f"/World/envs/env_{int(env_id)}/Robot_{agent_idx}/panda_hand"
+
+    def _payload_prim_path(self, env_id: int) -> str:
+        return f"/World/envs/env_{int(env_id)}/Payload"
+
+    def _process_grip_actions(self) -> None:
+        if not self._attachment_runtime_available:
+            return
+
+        phase_ids = self._phase_mgr.phase_ids
+        contact_phase_id = int(PHASE_TO_ID[Phase.CONTACT])
+        probe_phase_id = int(PHASE_TO_ID[Phase.PROBE])
+        regrip_phase_id = int(PHASE_TO_ID[Phase.REGRIP])
+        lift_phase_id = int(PHASE_TO_ID[Phase.LIFT])
+        attach_allowed = (phase_ids >= contact_phase_id) & (phase_ids < lift_phase_id)
+        collective_release_allowed = (phase_ids == probe_phase_id) | (phase_ids == regrip_phase_id)
+
+        grip_cmd = torch.stack(
+            [self._last_actions[name][:, BASE_ACT_DIM + ARM_ACT_DIM] for name in self.possible_agents],
+            dim=1,
+        )
+        release_request = torch.any(grip_cmd <= float(self.cfg.grip_release_threshold), dim=1)
+        release_envs = collective_release_allowed & release_request
+        for env_id in torch.nonzero(release_envs, as_tuple=False).view(-1).detach().to(device="cpu", dtype=torch.long).tolist():
+            for agent_name in self.possible_agents:
+                self._detach_vacuum(int(env_id), agent_name)
+
+        attach_force_threshold = float(
+            max(float(self.cfg.contact_force_threshold_n), float(self.cfg.grip_contact_force_threshold_n))
+        )
+        for agent_idx, agent_name in enumerate(self.possible_agents):
+            attached_mask = self._attachment_mask_for_agent(agent_name)
+            grip_request = grip_cmd[:, agent_idx] >= float(self.cfg.grip_attach_threshold)
+            force_n = self._contact_force_cache.get(agent_name)
+            if force_n is None:
+                force_n = self._safe_contact_force_norm(self._robot_entities[agent_name])
+            contact_ready = force_n >= attach_force_threshold
+            should_attach = attach_allowed & grip_request & contact_ready & (~attached_mask)
+            for env_id in (
+                torch.nonzero(should_attach, as_tuple=False).view(-1).detach().to(device="cpu", dtype=torch.long).tolist()
+            ):
+                self._attach_vacuum(
+                    int(env_id),
+                    agent_name,
+                    self._robot_hand_prim_path(int(env_id), agent_name),
+                    self._payload_prim_path(int(env_id)),
+                )
 
     def _update_belief_state(self) -> None:
         if not bool(self.cfg.use_belief_ekf) or not self._belief_ekf:
@@ -1534,10 +1628,17 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         neighbors = torch.cat(neighbor_blocks, dim=1) if neighbor_blocks else torch.zeros((self._num_envs, 27), dtype=torch.float32, device=self._device)
 
         phase = self._phase_one_hot()  # [N,10]
-        act = self._last_actions[agent_name]  # [N,6]
+        act = self._last_actions[agent_name]  # [N,7]
+        force_n = self._contact_force_cache.get(agent_name)
+        if force_n is None:
+            force_n = self._safe_contact_force_norm(robot)
+        grip_state = torch.zeros((self._num_envs, 3), dtype=torch.float32, device=self._device)
+        grip_state[:, 0] = torch.clamp(force_n / max(1.0, float(self.cfg.contact_force_overload_n)), 0.0, 1.5)
+        grip_state[:, 1] = self._attachment_mask_for_agent(agent_name).to(dtype=torch.float32)
+        grip_state[:, 2] = self._attachment_count_fraction()
 
-        # Assemble to exactly 61 dimensions with stable ordering.
-        parts = [ego, rel_payload, goal, neighbors, phase, act]  # total 6+6+6+27+10+6 = 61
+        # Assemble to exactly 65 dimensions with stable ordering.
+        parts = [ego, rel_payload, goal, neighbors, phase, act, grip_state]
         obs = torch.cat(parts, dim=1).to(dtype=torch.float32)
         if obs.shape[1] != AGENT_OBS_DIM:
             raise RuntimeError(f"Agent observation dim mismatch: expected {AGENT_OBS_DIM}, got {obs.shape[1]}")
@@ -1557,7 +1658,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._update_residual_goal_offset()
         # Explicit centralized critic input (do not rely on implicit concatenation fallback).
         per_agent_obs = [self._agent_obs(name, i) for i, name in enumerate(self.possible_agents)]
-        obs_cat = torch.cat(per_agent_obs, dim=1)  # [N, 244] for 4x61
+        obs_cat = torch.cat(per_agent_obs, dim=1)  # [N, 260] for 4x65
 
         payload = self._payload_features()  # [N,6]
         phase = self._phase_one_hot()  # [N,10]
@@ -1576,6 +1677,11 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         global_block[:, 39:43] = self._cbf_applied[:, :4].to(dtype=torch.float32)
         global_block[:, 43:47] = self._neural_barrier[:, :4]
         global_block[:, 47:49] = self._residual_goal_offset
+        global_block[:, 49:53] = torch.stack(
+            [self._attachment_mask_for_agent(name).to(dtype=torch.float32) for name in self.possible_agents],
+            dim=1,
+        )
+        global_block[:, 53:54] = self._attachment_count_fraction().view(-1, 1)
 
         state = torch.cat([obs_cat, global_block], dim=1).to(dtype=torch.float32)
         target_dim = int(self.cfg.state_space)
@@ -1614,6 +1720,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             if force_n is None:
                 force_n = self._safe_contact_force_norm(self._robot_entities[name])
             contact_bonus = 0.004 * (force_n >= float(self.cfg.contact_force_threshold_n)).to(dtype=torch.float32)
+            attach_bonus = 0.006 * self._attachment_mask_for_agent(name).to(dtype=torch.float32)
             overload_pen = 0.002 * torch.relu(force_n - overload_limit)
             cbf_pen = 0.002 * self._cbf_slack[:, agent_idx]
             intervention_pen = 0.001 * self._cbf_applied[:, agent_idx].to(dtype=torch.float32)
@@ -1625,6 +1732,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 - cbf_pen
                 - intervention_pen
                 + contact_bonus
+                + attach_bonus
                 + team_attach_bonus
                 + goal_bonus
                 + belief_bonus

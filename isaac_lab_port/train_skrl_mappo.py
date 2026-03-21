@@ -13,6 +13,12 @@ from pathlib import Path
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SKRL MAPPO bring-up for Isaac no-VLM cooperative transport task.")
     parser.add_argument("--headless", action="store_true", help="Run headless.")
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help='Simulation device. Use "cpu", "cuda", or "cuda:N".',
+    )
     parser.add_argument("--max-steps", type=int, default=100_000, help="Max training timesteps (for metadata only).")
     parser.add_argument("--num-envs", type=int, default=128, help="Requested env count (for metadata only).")
     parser.add_argument(
@@ -20,6 +26,12 @@ def _parse_args() -> argparse.Namespace:
         choices=("full", "approach", "contact", "probe", "lift"),
         default="full",
         help="Optional curriculum start phase for env resets.",
+    )
+    parser.add_argument(
+        "--lift-mass-level",
+        type=int,
+        default=0,
+        help="Index into the lift payload mass schedule (default 0 -> 6 kg).",
     )
     parser.add_argument("--print-only", action="store_true", help="Print resolved setup and exit.")
     parser.add_argument(
@@ -99,7 +111,7 @@ def _build_official_command(task_id: str) -> list[str]:
     ]
 
 
-def _launch_app(headless: bool):
+def _launch_app(args: argparse.Namespace):
     # Keep AppLauncher import and launch before importing isaaclab env modules.
     try:
         from isaaclab.app import AppLauncher
@@ -109,7 +121,7 @@ def _launch_app(headless: bool):
             "Install Isaac Lab 2.3.2 with Isaac Sim 5.1 and run via isaaclab.sh."
         ) from exc
 
-    launcher = AppLauncher(headless=headless)
+    launcher = AppLauncher(args)
     return launcher, launcher.app
 
 
@@ -120,18 +132,19 @@ def _load_env(load_isaaclab_env, task_id: str, num_envs: int):
         return load_isaaclab_env(task_name=task_id)
 
 
-def _build_env_cfg(num_envs: int, curriculum_phase: str):
+def _build_env_cfg(num_envs: int, curriculum_phase: str, device: str, lift_mass_level: int):
     try:
         from .direct_marl_env import NoVlmCoopTransportEnvCfg, NoVlmSceneCfg, SimulationCfg
     except ImportError:
         from direct_marl_env import NoVlmCoopTransportEnvCfg, NoVlmSceneCfg, SimulationCfg
 
-    device = "cuda:0"
+    sim_device = "cuda:0" if str(device).strip().lower() == "cuda" else str(device).strip()
     return NoVlmCoopTransportEnvCfg(
         scene=NoVlmSceneCfg(num_envs=int(num_envs), env_spacing=8.0),
-        device=device,
-        sim=SimulationCfg(dt=0.02, device=device),
+        device=sim_device,
+        sim=SimulationCfg(dt=0.02, device=sim_device),
         curriculum_phase=str(curriculum_phase).strip().lower(),
+        lift_payload_mass_level=int(lift_mass_level),
     )
 
 
@@ -554,7 +567,9 @@ def main() -> None:
         "task_id": TASK_ID,
         "requested_num_envs": int(args.num_envs),
         "requested_max_steps": int(args.max_steps),
+        "requested_device": str(args.device),
         "curriculum_phase": str(args.curriculum_phase),
+        "lift_mass_level": int(args.lift_mass_level),
         "official_train_command": " ".join(official_cmd + (["--headless"] if args.headless else [])),
         "cwd": str(Path.cwd()),
     }
@@ -578,7 +593,7 @@ def main() -> None:
     _launcher = None
     sim_app = None
     try:
-        _launcher, sim_app = _launch_app(headless=bool(args.headless))
+        _launcher, sim_app = _launch_app(args)
         print("[bootstrap] AppLauncher started.", flush=True)
         import gymnasium as gym
         from isaaclab_rl.skrl import SkrlVecEnvWrapper
@@ -591,7 +606,12 @@ def main() -> None:
         ) from exc
 
     try:
-        env_cfg = _build_env_cfg(num_envs=int(args.num_envs), curriculum_phase=str(args.curriculum_phase))
+        env_cfg = _build_env_cfg(
+            num_envs=int(args.num_envs),
+            curriculum_phase=str(args.curriculum_phase),
+            device=str(args.device),
+            lift_mass_level=int(args.lift_mass_level),
+        )
         if args.smoke_test:
             env_cfg.debug_belief_steps = max(0, int(args.smoke_ekf_debug_steps))
             env_cfg.debug_cbf_steps = max(0, int(args.smoke_ekf_debug_steps))

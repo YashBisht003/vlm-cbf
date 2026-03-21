@@ -496,6 +496,7 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
     probe_belief_mass_rel_threshold: float = 0.05
     grip_attach_threshold: float = 0.25
     grip_release_threshold: float = -0.25
+    grip_consensus_release_votes: int = 2
     grip_contact_force_threshold_n: float = 10.0
     regrip_balance_std_n: float = 15.0
     debug_belief_steps: int = 0
@@ -1462,9 +1463,24 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             [self._last_actions[name][:, BASE_ACT_DIM + ARM_ACT_DIM] for name in self.possible_agents],
             dim=1,
         )
-        release_request = torch.any(grip_cmd <= float(self.cfg.grip_release_threshold), dim=1)
-        release_envs = collective_release_allowed & release_request
-        for env_id in torch.nonzero(release_envs, as_tuple=False).view(-1).detach().to(device="cpu", dtype=torch.long).tolist():
+
+        # In probe/regrip, let individual robots drop a bad seal without forcing a full team release.
+        for agent_idx, agent_name in enumerate(self.possible_agents):
+            per_robot_release = grip_cmd[:, agent_idx] <= float(self.cfg.grip_release_threshold)
+            release_envs = collective_release_allowed & per_robot_release
+            for env_id in (
+                torch.nonzero(release_envs, as_tuple=False).view(-1).detach().to(device="cpu", dtype=torch.long).tolist()
+            ):
+                self._detach_vacuum(int(env_id), agent_name)
+
+        # In regrip, escalate to a full-team reset only if enough robots agree the team geometry is bad.
+        in_regrip = phase_ids == regrip_phase_id
+        release_votes = (grip_cmd <= float(self.cfg.grip_release_threshold)).sum(dim=1)
+        vote_threshold = int(np.clip(int(self.cfg.grip_consensus_release_votes), 1, max(1, self.cfg.num_robots)))
+        consensus_release = in_regrip & (release_votes >= vote_threshold)
+        for env_id in (
+            torch.nonzero(consensus_release, as_tuple=False).view(-1).detach().to(device="cpu", dtype=torch.long).tolist()
+        ):
             for agent_name in self.possible_agents:
                 self._detach_vacuum(int(env_id), agent_name)
 
@@ -1488,6 +1504,23 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                     self._robot_hand_prim_path(int(env_id), agent_name),
                     self._payload_prim_path(int(env_id)),
                 )
+
+    def _detach_overloaded_attachments(self) -> None:
+        if not self._attachment_runtime_available:
+            return
+        overload_limit = float(self.cfg.contact_force_overload_n)
+        for agent_name in self.possible_agents:
+            attached_mask = self._attachment_mask_for_agent(agent_name)
+            if not torch.any(attached_mask):
+                continue
+            force_n = self._contact_force_cache.get(agent_name)
+            if force_n is None:
+                force_n = self._safe_contact_force_norm(self._robot_entities[agent_name])
+            overload_mask = attached_mask & (force_n > overload_limit)
+            for env_id in (
+                torch.nonzero(overload_mask, as_tuple=False).view(-1).detach().to(device="cpu", dtype=torch.long).tolist()
+            ):
+                self._detach_vacuum(int(env_id), agent_name)
 
     def _update_belief_state(self) -> None:
         if not bool(self.cfg.use_belief_ekf) or not self._belief_ekf:
@@ -1704,12 +1737,25 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._update_belief_state()
         self._update_residual_goal_offset()
         self._phase_mgr.update(phase_inputs, now_s=self._episode_time_seconds())
+        self._detach_overloaded_attachments()
         payload_xy = self._payload_features()[:, 0:2]
         adjusted_goal_xy = self._goal_xy + self._residual_goal_offset
         goal_dist = torch.linalg.vector_norm(payload_xy - adjusted_goal_xy, dim=1)
         goal_bonus = 0.02 * (1.0 - torch.tanh(goal_dist))
 
-        team_attach_bonus = 0.01 * phase_inputs.all_attached.to(dtype=torch.float32)
+        current_all_attached = phase_inputs.all_attached
+        if self._attachment_runtime_available:
+            current_all_attached = self._attachment_counts() >= int(self.cfg.num_robots)
+        team_attach_bonus = 0.01 * current_all_attached.to(dtype=torch.float32)
+        contact_force_stack = torch.stack([self._contact_force_cache[name] for name in self.possible_agents], dim=1)
+        in_probe_mask = self._phase_mgr.phase_ids == int(PHASE_TO_ID[Phase.PROBE])
+        balance_bonus = 0.003 * in_probe_mask.to(dtype=torch.float32) * (
+            1.0
+            - torch.tanh(
+                torch.std(contact_force_stack, dim=1, unbiased=False)
+                / float(max(1.0e-6, self.cfg.contact_force_balance_std_n))
+            )
+        )
         rewards: Dict[str, torch.Tensor] = {}
         overload_limit = float(self.cfg.contact_force_overload_n)
         for name in self.possible_agents:
@@ -1734,6 +1780,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 + contact_bonus
                 + attach_bonus
                 + team_attach_bonus
+                + balance_bonus
                 + goal_bonus
                 + belief_bonus
             ).to(dtype=torch.float32)

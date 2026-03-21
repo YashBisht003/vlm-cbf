@@ -99,19 +99,22 @@ class AutoAttachmentBackend:
             if not child_prim.IsValid():
                 raise RuntimeError(f"Child rigid body prim is invalid: {child_rigid_body_path}")
 
+            # Anchor the weld at the current hand pose, not at the payload origin.
+            # With multiple robots, anchoring every joint at the child body's origin creates
+            # an inconsistent closed loop where all hands try to occupy the same payload point.
             joint = UsdPhysics.FixedJoint.Define(stage, Sdf.Path(attachment_prim_path))
             xf_cache = UsdGeom.XformCache()
-            child_pose = xf_cache.GetLocalToWorldTransform(child_prim).RemoveScaleShear()
             parent_pose = xf_cache.GetLocalToWorldTransform(parent_prim).RemoveScaleShear()
-            rel_pose = child_pose * parent_pose.GetInverse()
-            rel_pose = rel_pose.RemoveScaleShear()
+            child_pose = xf_cache.GetLocalToWorldTransform(child_prim).RemoveScaleShear()
+            parent_in_child = (parent_pose * child_pose.GetInverse()).RemoveScaleShear()
 
             joint.CreateBody0Rel().SetTargets([Sdf.Path(parent_rigid_body_path)])
             joint.CreateBody1Rel().SetTargets([Sdf.Path(child_rigid_body_path)])
-            joint.CreateLocalPos0Attr().Set(Gf.Vec3f(rel_pose.ExtractTranslation()))
-            joint.CreateLocalRot0Attr().Set(Gf.Quatf(rel_pose.ExtractRotationQuat()))
-            joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0))
-            joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
+            joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0))
+            joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
+            joint.CreateLocalPos1Attr().Set(Gf.Vec3f(parent_in_child.ExtractTranslation()))
+            joint.CreateLocalRot1Attr().Set(Gf.Quatf(parent_in_child.ExtractRotationQuat()))
+            joint.CreateExcludeFromArticulationAttr().Set(True)
             joint.CreateBreakForceAttr().Set(3.40282347e38)
             joint.CreateBreakTorqueAttr().Set(3.40282347e38)
             return attachment_prim_path

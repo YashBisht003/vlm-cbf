@@ -57,7 +57,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--smoke-policy",
-        choices=("random", "scripted_approach", "scripted_contact_hold", "scripted_phase"),
+        choices=("random", "scripted_approach", "scripted_contact_hold", "scripted_phase", "scripted_lift"),
         default="random",
         help="Action source for smoke test.",
     )
@@ -71,6 +71,18 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Number of early env steps to print EKF/CBF debug diagnostics for in smoke mode.",
+    )
+    parser.add_argument(
+        "--smoke-arm-joint",
+        type=int,
+        default=1,
+        help="Arm control channel index to excite for scripted_lift (0..2).",
+    )
+    parser.add_argument(
+        "--smoke-arm-sign",
+        type=float,
+        default=1.0,
+        help="Signed magnitude for the selected scripted_lift arm channel.",
     )
     return parser.parse_args()
 
@@ -258,6 +270,23 @@ def _scripted_phase_policy_actions(wrapped, raw_env):
     return actions
 
 
+def _scripted_lift_actions(wrapped, raw_env, args: argparse.Namespace):
+    import torch
+
+    actions = {}
+    lift_arm = torch.zeros((wrapped.num_envs, 3), dtype=torch.float32, device=wrapped.device)
+    arm_joint = int(max(0, min(2, int(args.smoke_arm_joint))))
+    arm_sign = float(max(-1.0, min(1.0, float(args.smoke_arm_sign))))
+    lift_arm[:, arm_joint] = arm_sign
+    zero_xy = torch.zeros((wrapped.num_envs, 2), dtype=torch.float32, device=wrapped.device)
+    zero_yaw = torch.zeros((wrapped.num_envs, 1), dtype=torch.float32, device=wrapped.device)
+    grip = torch.ones((wrapped.num_envs, 1), dtype=torch.float32, device=wrapped.device)
+    for agent_name in wrapped.action_spaces:
+        act_dim = int(wrapped.action_spaces[agent_name].shape[0])
+        actions[agent_name] = _pack_agent_action(zero_xy, zero_yaw, lift_arm, grip, act_dim)
+    return actions
+
+
 def _contact_stats(raw_env, threshold: float):
     import torch
 
@@ -273,6 +302,79 @@ def _contact_stats(raw_env, threshold: float):
         "max": float(torch.max(vals).item()),
         "nonzero": nz,
         "total": int(vals.numel()),
+    }
+
+
+def _payload_height_stats(raw_env, reset_z=None):
+    import torch
+
+    payload = getattr(raw_env, "_payload_entity", None)
+    if payload is None or not hasattr(raw_env, "_safe_root_state"):
+        return None
+    root = raw_env._safe_root_state(payload)
+    if not isinstance(root, torch.Tensor) or root.ndim != 2 or root.shape[1] < 3:
+        return None
+    z = root[:, 2].detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    if z.numel() == 0:
+        return None
+    out = {
+        "mean": float(torch.mean(z).item()),
+        "min": float(torch.min(z).item()),
+        "max": float(torch.max(z).item()),
+    }
+    if reset_z is not None:
+        base = reset_z.reshape(-1)
+        n = min(int(base.numel()), int(z.numel()))
+        if n > 0:
+            dz = z[:n] - base[:n]
+            out["delta_mean"] = float(torch.mean(dz).item())
+            out["delta_max"] = float(torch.max(dz).item())
+    return out
+
+
+def _hand_height_stats(raw_env):
+    import torch
+
+    hand_z = []
+    for agent_name in getattr(raw_env, "possible_agents", ()):
+        robot = raw_env._robot_entities.get(agent_name)
+        if robot is None or not hasattr(robot, "find_bodies"):
+            continue
+        try:
+            body_ids, _ = robot.find_bodies("panda_hand")
+        except Exception:
+            continue
+        if not body_ids or not hasattr(robot, "data") or not hasattr(robot.data, "body_state_w"):
+            continue
+        body_state = robot.data.body_state_w
+        if not isinstance(body_state, torch.Tensor) or body_state.ndim != 3:
+            continue
+        hand_idx = int(body_ids[0])
+        if hand_idx >= int(body_state.shape[1]):
+            continue
+        hand_z.append(body_state[:, hand_idx, 2].detach().to(device="cpu", dtype=torch.float32).reshape(-1))
+    if not hand_z:
+        return None
+    stacked = torch.stack(hand_z, dim=1)
+    return {
+        "mean": float(torch.mean(stacked).item()),
+        "min": float(torch.min(stacked).item()),
+        "max": float(torch.max(stacked).item()),
+    }
+
+
+def _attachment_stats(raw_env):
+    import torch
+
+    counts = getattr(raw_env, "_attachment_count_buf", None)
+    if not isinstance(counts, torch.Tensor):
+        return None
+    vals = counts.detach().to(device="cpu", dtype=torch.float32).reshape(-1)
+    if vals.numel() == 0:
+        return None
+    return {
+        "mean": float(torch.mean(vals).item()),
+        "max": float(torch.max(vals).item()),
     }
 
 
@@ -301,6 +403,8 @@ def _force_contact_probe_pose(raw_env) -> None:
 
 
 def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
+    import torch
+
     if int(args.smoke_steps) <= 0:
         raise ValueError("--smoke-steps must be > 0")
     if int(args.smoke_log_every) <= 0:
@@ -313,6 +417,28 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
     first_agent = next(iter(obs.keys()))
     print(f"[smoke] policy obs shape ({first_agent}): {tuple(obs[first_agent].shape)}", flush=True)
     print(f"[smoke] value state shape: {tuple(state.shape)}", flush=True)
+    payload_stats = _payload_height_stats(raw_env)
+    reset_payload_z = None
+    if payload_stats is not None and getattr(raw_env, "_payload_entity", None) is not None:
+        reset_payload_z = raw_env._safe_root_state(raw_env._payload_entity)[:, 2].detach().to(device="cpu", dtype=torch.float32)
+        hand_stats = _hand_height_stats(raw_env)
+        attach_stats = _attachment_stats(raw_env)
+        print(
+            "[smoke] payload z start mean {:.6f} | min {:.6f} | max {:.6f}".format(
+                payload_stats["mean"],
+                payload_stats["min"],
+                payload_stats["max"],
+            ),
+            flush=True,
+        )
+        if hand_stats is not None or attach_stats is not None:
+            hand_suffix = ""
+            if hand_stats is not None:
+                hand_suffix = " | hand z mean {:.6f}".format(hand_stats["mean"])
+            attach_suffix = ""
+            if attach_stats is not None:
+                attach_suffix = " | attachments mean {:.2f}".format(attach_stats["mean"])
+            print(f"[smoke] start diagnostics{hand_suffix}{attach_suffix}", flush=True)
 
     nonzero_seen = False
     max_force_seen = 0.0
@@ -324,6 +450,8 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
             actions = _scripted_contact_hold_actions(wrapped, raw_env)
         elif args.smoke_policy == "scripted_approach":
             actions = _scripted_approach_actions(wrapped, raw_env)
+        elif args.smoke_policy == "scripted_lift":
+            actions = _scripted_lift_actions(wrapped, raw_env, args)
         else:
             actions = _random_actions(wrapped)
         wrapped.step(actions)
@@ -333,14 +461,51 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
             nonzero_seen = nonzero_seen or (stats["nonzero"] > 0)
             max_force_seen = max(max_force_seen, float(stats["max"]))
             if (step == 0) or ((step + 1) % int(args.smoke_log_every) == 0) or (step + 1 == int(args.smoke_steps)):
+                live_baseline_z = getattr(raw_env, "_payload_reset_z", None)
+                if not isinstance(live_baseline_z, torch.Tensor):
+                    live_baseline_z = reset_payload_z
+                else:
+                    live_baseline_z = live_baseline_z.detach().to(device="cpu", dtype=torch.float32)
+                payload_stats = _payload_height_stats(raw_env, reset_z=live_baseline_z)
+                hand_stats = _hand_height_stats(raw_env)
+                attach_stats = _attachment_stats(raw_env)
+                phase_ids = getattr(getattr(raw_env, "_phase_mgr", None), "phase_ids", None)
+                phase_suffix = ""
+                if isinstance(phase_ids, torch.Tensor) and phase_ids.numel() > 0:
+                    phase_cpu = phase_ids.detach().to(device="cpu", dtype=torch.int64).reshape(-1)
+                    phase_suffix = f" | phase {int(torch.mode(phase_cpu).values.item())}"
+                settle_suffix = ""
+                lift_ready = getattr(raw_env, "_lift_settle_baseline_captured", None)
+                if isinstance(lift_ready, torch.Tensor) and lift_ready.numel() > 0:
+                    settle_suffix = f" | lift_ready {bool(torch.all(lift_ready).item())}"
+                payload_suffix = ""
+                if payload_stats is not None:
+                    payload_suffix = (
+                        " | payload z mean {:.6f} | dz mean {:.6f} | dz max {:.6f}".format(
+                            payload_stats["mean"],
+                            payload_stats.get("delta_mean", 0.0),
+                            payload_stats.get("delta_max", 0.0),
+                        )
+                    )
+                hand_suffix = ""
+                if hand_stats is not None:
+                    hand_suffix = " | hand z mean {:.6f}".format(hand_stats["mean"])
+                attach_suffix = ""
+                if attach_stats is not None:
+                    attach_suffix = " | attachments mean {:.2f}".format(attach_stats["mean"])
                 print(
-                    "[smoke] step {}/{} | contact mean {:.6f} | contact max {:.6f} | nonzero {}/{}".format(
+                    "[smoke] step {}/{} | contact mean {:.6f} | contact max {:.6f} | nonzero {}/{}{}{}{}{}{}".format(
                         step + 1,
                         int(args.smoke_steps),
                         stats["mean"],
                         stats["max"],
                         stats["nonzero"],
                         stats["total"],
+                        payload_suffix,
+                        hand_suffix,
+                        attach_suffix,
+                        phase_suffix,
+                        settle_suffix,
                     )
                 , flush=True)
     elapsed = time.time() - t0

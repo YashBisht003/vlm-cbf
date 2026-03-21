@@ -568,6 +568,11 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
     lift_contact_preload_m: float = 0.02
     lift_contact_vertical_preload_m: float = 0.02
     lift_height_m: float = 0.18
+    lift_fail_payload_z_min_m: float = 0.05
+    lift_fail_payload_z_max_m: float = 0.75
+    lift_fail_root_z_max_m: float = 0.35
+    lift_fail_upright_min: float = 0.5
+    lift_fail_min_attachments: int = 3
     place_height_m: float = 0.09
     goal_tolerance_m: float = 0.30
     viewer: ViewerCfg = field(
@@ -618,6 +623,16 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
             raise ValueError("lift_payload_mass_level must index into lift_payload_mass_levels_kg.")
         if float(self.lift_contact_preload_m) < 0.0:
             raise ValueError("lift_contact_preload_m must be >= 0.")
+        if float(self.lift_fail_payload_z_min_m) < 0.0:
+            raise ValueError("lift_fail_payload_z_min_m must be >= 0.")
+        if float(self.lift_fail_payload_z_max_m) <= float(self.lift_fail_payload_z_min_m):
+            raise ValueError("lift_fail_payload_z_max_m must be > lift_fail_payload_z_min_m.")
+        if float(self.lift_fail_root_z_max_m) < 0.0:
+            raise ValueError("lift_fail_root_z_max_m must be >= 0.")
+        if not (-1.0 <= float(self.lift_fail_upright_min) <= 1.0):
+            raise ValueError("lift_fail_upright_min must be in [-1, 1].")
+        if int(self.lift_fail_min_attachments) < 0 or int(self.lift_fail_min_attachments) > int(self.num_robots):
+            raise ValueError("lift_fail_min_attachments must be between 0 and num_robots.")
         if float(self.lift_contact_vertical_preload_m) < 0.0:
             raise ValueError("lift_contact_vertical_preload_m must be >= 0.")
         self.sim.device = str(self.device)
@@ -1662,12 +1677,11 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         if phase_name == "lift":
             self._set_lift_arm_posture(env_ids)
             self._set_lift_arm_gains(env_ids)
-            self._stage_payload_out_of_way(env_ids)
+            self._place_payload_on_ground(env_ids)
             self._layout_curriculum_robots(env_ids, margin_override=self.cfg.lift_reset_standoff_m)
             self._sync_scene_kinematics()
             self._apply_lift_hold_targets(env_ids)
-            self._hidden_physics_steps(2)
-            self._place_payload_on_ground(env_ids)
+            self._sync_scene_kinematics()
             self._align_lift_hands_to_payload_faces(env_ids)
             self._sync_scene_kinematics()
             self._create_stage0_lift_attachments(env_ids)
@@ -2254,6 +2268,64 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 stats[f"control/{joint_name}_target_mean"] = torch.mean(tgt_cat).detach()
         return stats
 
+    def _robot_root_upright_stack(self) -> torch.Tensor | None:
+        upright_vals: list[torch.Tensor] = []
+        for agent_name in self.possible_agents:
+            robot = self._robot_entities.get(agent_name)
+            root_state = self._safe_root_state(robot)
+            if not isinstance(root_state, torch.Tensor) or root_state.ndim != 2 or root_state.shape[1] < 7:
+                continue
+            quat = root_state[:, 3:7].to(device=self._device, dtype=torch.float32)
+            # World-space z component of the body z-axis. 1.0 is perfectly upright, negative is upside down.
+            upright_vals.append(1.0 - 2.0 * (quat[:, 1] * quat[:, 1] + quat[:, 2] * quat[:, 2]))
+        if not upright_vals:
+            return None
+        return torch.stack(upright_vals, dim=1)
+
+    def _robot_root_z_stack(self) -> torch.Tensor | None:
+        root_z_vals: list[torch.Tensor] = []
+        for agent_name in self.possible_agents:
+            robot = self._robot_entities.get(agent_name)
+            root_state = self._safe_root_state(robot)
+            if not isinstance(root_state, torch.Tensor) or root_state.ndim != 2 or root_state.shape[1] < 3:
+                continue
+            root_z_vals.append(root_state[:, 2].to(device=self._device, dtype=torch.float32))
+        if not root_z_vals:
+            return None
+        return torch.stack(root_z_vals, dim=1)
+
+    def _lift_failure_masks(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        false_mask = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
+        if self._curriculum_phase != "lift" or self._payload_entity is None:
+            return false_mask, false_mask, false_mask, false_mask
+
+        payload_root = self._safe_root_state(self._payload_entity)
+        if not isinstance(payload_root, torch.Tensor) or payload_root.ndim != 2 or payload_root.shape[1] < 3:
+            return false_mask, false_mask, false_mask, false_mask
+
+        payload_z = self._sanitize_env_tensor(payload_root[:, 2], invalid_mask=None, fill_value=0.0)
+        payload_fail = (payload_z < float(self.cfg.lift_fail_payload_z_min_m)) | (
+            payload_z > float(self.cfg.lift_fail_payload_z_max_m)
+        )
+
+        root_fail = false_mask.clone()
+        root_z_stack = self._robot_root_z_stack()
+        if root_z_stack is not None:
+            root_z_stack = self._sanitize_env_tensor(root_z_stack, invalid_mask=None, fill_value=0.0)
+            root_fail = torch.any(root_z_stack > float(self.cfg.lift_fail_root_z_max_m), dim=1)
+
+        tip_fail = false_mask.clone()
+        upright_stack = self._robot_root_upright_stack()
+        if upright_stack is not None:
+            upright_stack = self._sanitize_env_tensor(upright_stack, invalid_mask=None, fill_value=-1.0)
+            tip_fail = torch.any(upright_stack < float(self.cfg.lift_fail_upright_min), dim=1)
+
+        attach_fail = false_mask.clone()
+        if not self._lift_uses_contact_only():
+            attach_fail = self._attachment_counts() < int(self.cfg.lift_fail_min_attachments)
+
+        return payload_fail | root_fail, tip_fail, attach_fail, payload_fail | root_fail | tip_fail | attach_fail
+
     def _update_log_extras(
         self,
         *,
@@ -2263,6 +2335,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         lift_shaping: torch.Tensor,
         lift_ready_mask: torch.Tensor,
         goal_dist: torch.Tensor,
+        invalid_mask: torch.Tensor | None = None,
     ) -> None:
         log: Dict[str, torch.Tensor] = {}
         attachment_count = self._attachment_counts().to(dtype=torch.float32)
@@ -2271,22 +2344,24 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             contact_stack = torch.stack([self._contact_force_cache[name] for name in self.possible_agents], dim=1)
         hand_z_vals: list[torch.Tensor] = []
         tool_z_vals: list[torch.Tensor] = []
-        upright_vals: list[torch.Tensor] = []
-        root_z_vals: list[torch.Tensor] = []
+        upright_stack = self._robot_root_upright_stack()
+        root_z_stack = self._robot_root_z_stack()
         for agent_name in self.possible_agents:
             robot = self._robot_entities.get(agent_name)
-            root_state = self._safe_root_state(robot)
-            if isinstance(root_state, torch.Tensor) and root_state.ndim == 2 and root_state.shape[1] >= 7:
-                quat = root_state[:, 3:7].to(device=self._device, dtype=torch.float32)
-                root_z_vals.append(root_state[:, 2].to(device=self._device, dtype=torch.float32))
-                # World-space z component of the body z-axis. 1.0 is perfectly upright, negative is upside down.
-                upright_vals.append(1.0 - 2.0 * (quat[:, 1] * quat[:, 1] + quat[:, 2] * quat[:, 2]))
             hand_state = self._hand_body_state(robot)
             if hand_state is not None:
                 hand_z_vals.append(hand_state[:, 2].to(device=self._device, dtype=torch.float32))
             tool_state = self._tool_body_state(robot)
             if tool_state is not None:
                 tool_z_vals.append(tool_state[:, 2].to(device=self._device, dtype=torch.float32))
+        payload_z = self._sanitize_env_tensor(payload_z, invalid_mask=invalid_mask, fill_value=0.0)
+        lift_delta_z = self._sanitize_env_tensor(lift_delta_z, invalid_mask=invalid_mask, fill_value=0.0)
+        lift_progress = self._sanitize_env_tensor(lift_progress, invalid_mask=invalid_mask, fill_value=0.0)
+        lift_shaping = self._sanitize_env_tensor(lift_shaping, invalid_mask=invalid_mask, fill_value=0.0)
+        goal_dist = self._sanitize_env_tensor(goal_dist, invalid_mask=invalid_mask, fill_value=0.0)
+        attachment_count = self._sanitize_env_tensor(attachment_count, invalid_mask=invalid_mask, fill_value=0.0)
+        if contact_stack is not None:
+            contact_stack = self._sanitize_env_tensor(contact_stack, invalid_mask=invalid_mask, fill_value=0.0)
         log["phase/id_mean"] = torch.mean(self._phase_mgr.phase_ids.to(dtype=torch.float32)).detach()
         log["payload/mass_mean_kg"] = torch.mean(self._payload_mass_kg).detach()
         log["payload/z_mean"] = torch.mean(payload_z).detach()
@@ -2301,16 +2376,30 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             float(self._attachment_runtime_available), dtype=torch.float32, device=self._device
         )
         if hand_z_vals:
-            log["control/hand_z_mean"] = torch.mean(torch.cat(hand_z_vals, dim=0)).detach()
+            log["control/hand_z_mean"] = torch.mean(
+                self._sanitize_env_tensor(torch.cat(hand_z_vals, dim=0), invalid_mask=None, fill_value=0.0)
+            ).detach()
         if tool_z_vals:
-            log["control/tool_z_mean"] = torch.mean(torch.cat(tool_z_vals, dim=0)).detach()
-        if root_z_vals:
-            log["base/root_z_mean"] = torch.mean(torch.cat(root_z_vals, dim=0)).detach()
-        if upright_vals:
-            upright_cat = torch.cat(upright_vals, dim=0)
-            log["base/upright_mean"] = torch.mean(upright_cat).detach()
-            log["base/upright_min"] = torch.min(upright_cat).detach()
-            log["base/upside_down_frac"] = torch.mean((upright_cat < 0.0).to(dtype=torch.float32)).detach()
+            log["control/tool_z_mean"] = torch.mean(
+                self._sanitize_env_tensor(torch.cat(tool_z_vals, dim=0), invalid_mask=None, fill_value=0.0)
+            ).detach()
+        if root_z_stack is not None:
+            log["base/root_z_mean"] = torch.mean(
+                self._sanitize_env_tensor(root_z_stack, invalid_mask=None, fill_value=0.0)
+            ).detach()
+        if upright_stack is not None:
+            upright_stack = self._sanitize_env_tensor(upright_stack, invalid_mask=None, fill_value=0.0)
+            log["base/upright_mean"] = torch.mean(upright_stack).detach()
+            log["base/upright_min"] = torch.min(upright_stack).detach()
+            log["base/upside_down_frac"] = torch.mean((upright_stack < 0.0).to(dtype=torch.float32)).detach()
+        if invalid_mask is not None:
+            log["debug/invalid_state_frac"] = torch.mean(invalid_mask.to(dtype=torch.float32)).detach()
+        lift_height_fail, lift_tip_fail, lift_attach_fail, lift_fail = self._lift_failure_masks()
+        if self._curriculum_phase == "lift":
+            log["debug/lift_failure_frac"] = torch.mean(lift_fail.to(dtype=torch.float32)).detach()
+            log["debug/lift_height_fail_frac"] = torch.mean(lift_height_fail.to(dtype=torch.float32)).detach()
+            log["debug/lift_tip_fail_frac"] = torch.mean(lift_tip_fail.to(dtype=torch.float32)).detach()
+            log["debug/lift_attach_fail_frac"] = torch.mean(lift_attach_fail.to(dtype=torch.float32)).detach()
         if contact_stack is not None:
             log["contact/mean_n"] = torch.mean(contact_stack).detach()
             log["contact/std_n"] = torch.std(contact_stack, unbiased=False).detach()
@@ -2364,6 +2453,64 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             0.0,
             1.0,
         )
+
+    def _sanitize_env_tensor(
+        self,
+        tensor: torch.Tensor,
+        invalid_mask: torch.Tensor | None = None,
+        fill_value: float = 0.0,
+    ) -> torch.Tensor:
+        out = torch.nan_to_num(
+            tensor.to(device=self._device, dtype=torch.float32),
+            nan=float(fill_value),
+            posinf=float(fill_value),
+            neginf=float(fill_value),
+        )
+        if invalid_mask is not None and out.ndim > 0 and int(out.shape[0]) == self._num_envs and torch.any(invalid_mask):
+            out = out.clone()
+            out[invalid_mask] = float(fill_value)
+        return out
+
+    def _invalid_state_mask(self) -> torch.Tensor:
+        invalid = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
+
+        def _accumulate_invalid(tensor: torch.Tensor | None) -> None:
+            nonlocal invalid
+            if not isinstance(tensor, torch.Tensor):
+                return
+            data = tensor.to(device=self._device)
+            if data.ndim == 0:
+                if not bool(torch.isfinite(data).item()):
+                    invalid[:] = True
+                return
+            if int(data.shape[0]) != self._num_envs:
+                if int(data.shape[0]) == 1:
+                    data = data.repeat(self._num_envs, *([1] * (data.ndim - 1)))
+                else:
+                    return
+            finite = torch.isfinite(data)
+            if finite.ndim == 1:
+                invalid |= ~finite.to(dtype=torch.bool)
+                return
+            finite = finite.reshape(self._num_envs, -1).all(dim=1)
+            invalid |= ~finite.to(dtype=torch.bool)
+
+        _accumulate_invalid(self._safe_root_state(self._payload_entity))
+        _accumulate_invalid(self._payload_reset_z)
+        _accumulate_invalid(self._belief_mu)
+        _accumulate_invalid(self._belief_cov_diag)
+        _accumulate_invalid(self._belief_uncertainty)
+
+        for robot in self._robot_entities.values():
+            _accumulate_invalid(self._safe_root_state(robot))
+            if robot is None or not hasattr(robot, "data"):
+                continue
+            data = robot.data
+            _accumulate_invalid(getattr(data, "joint_pos", None))
+            _accumulate_invalid(getattr(data, "joint_vel", None))
+            _accumulate_invalid(getattr(data, "body_state_w", None))
+
+        return invalid
 
     def _robot_tool_prim_path(self, env_id: int, agent_name: str) -> str:
         agent_idx = int(str(agent_name).split("_")[-1])
@@ -2670,6 +2817,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
 
     def _get_rewards(self) -> Dict[str, torch.Tensor]:
         self._refresh_entity_buffers()
+        invalid_mask = self._invalid_state_mask()
         phase_inputs = self._phase_inputs()
         self._update_belief_state()
         self._update_residual_goal_offset()
@@ -2711,6 +2859,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             lift_shaping=lift_shaping,
             lift_ready_mask=lift_ready_mask,
             goal_dist=goal_dist,
+            invalid_mask=invalid_mask,
         )
         rewards: Dict[str, torch.Tensor] = {}
         overload_limit = float(self.cfg.contact_force_overload_n)
@@ -2743,11 +2892,18 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 + lift_shaping
                 + belief_bonus
             ).to(dtype=torch.float32)
+            rewards[name] = self._sanitize_env_tensor(rewards[name], invalid_mask=None, fill_value=-1.0)
+            if torch.any(invalid_mask):
+                rewards[name] = rewards[name].clone()
+                rewards[name][invalid_mask] = -1.0
         return rewards
 
     def _get_dones(self) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         done_phase_id = int(PHASE_TO_ID[Phase.DONE])
         terminated = self._phase_mgr.phase_ids == done_phase_id
+        terminated |= self._invalid_state_mask()
+        _, _, _, lift_fail = self._lift_failure_masks()
+        terminated |= lift_fail
         if hasattr(self, "episode_length_buf") and hasattr(self, "max_episode_length"):
             truncated = self.episode_length_buf >= int(max(1, int(self.max_episode_length) - 1))
             truncated = truncated.to(device=self._device, dtype=torch.bool)

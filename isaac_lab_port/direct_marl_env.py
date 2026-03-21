@@ -411,7 +411,7 @@ def _build_agent_spaces(agent_names: Sequence[str]) -> tuple[Dict[str, int], Dic
 class NoVlmSceneCfg(InteractiveSceneCfg):
     num_envs: int = 128
     env_spacing: float = 8.0
-    replicate_physics: bool = False
+    replicate_physics: bool = True
     robot_0: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_0"))
     robot_1: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_1"))
     robot_2: ArticulationCfg = field(default_factory=lambda: _default_ridgeback_franka_cfg(f"{ENV_REGEX_NS}/Robot_2"))
@@ -1612,6 +1612,8 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 )
             self._pending_lift_attachments = still_pending
             try:
+                if ready:
+                    self._refresh_entity_buffers()
                 for env_id, agent_name in ready:
                     self._attach_vacuum(
                         int(env_id),
@@ -2200,8 +2202,37 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         key = (int(env_id), str(agent_name))
         if key in self._attachments:
             return
+        parent_pos_w = None
+        parent_quat_w = None
+        child_pos_w = None
+        child_quat_w = None
+        robot = self._robot_entities.get(agent_name)
+        hand_state = self._hand_body_state(robot) if robot is not None else None
+        if hand_state is not None and int(env_id) < int(hand_state.shape[0]):
+            hand_pose = hand_state[int(env_id)]
+            parent_pos_w = (float(hand_pose[0]), float(hand_pose[1]), float(hand_pose[2]))
+            parent_quat_w = (float(hand_pose[3]), float(hand_pose[4]), float(hand_pose[5]), float(hand_pose[6]))
+        if self._payload_entity is not None:
+            payload_root = self._safe_root_state(self._payload_entity)
+            if int(env_id) < int(payload_root.shape[0]):
+                payload_pose = payload_root[int(env_id)]
+                child_pos_w = (float(payload_pose[0]), float(payload_pose[1]), float(payload_pose[2]))
+                child_quat_w = (
+                    float(payload_pose[3]),
+                    float(payload_pose[4]),
+                    float(payload_pose[5]),
+                    float(payload_pose[6]),
+                )
         attachment_path = self._attachment_prim_path(env_id, agent_name)
-        created_path = self._attachment_backend.attach(attachment_path, parent_rigid_body_path, child_rigid_body_path)
+        created_path = self._attachment_backend.attach(
+            attachment_prim_path=attachment_path,
+            parent_rigid_body_path=parent_rigid_body_path,
+            child_rigid_body_path=child_rigid_body_path,
+            parent_pos_w=parent_pos_w,
+            parent_quat_w=parent_quat_w,
+            child_pos_w=child_pos_w,
+            child_quat_w=child_quat_w,
+        )
         if self._curriculum_phase == "lift":
             print(
                 f"[attach] path={created_path} backend={getattr(self._attachment_backend, '_backend_kind', 'unknown')} "

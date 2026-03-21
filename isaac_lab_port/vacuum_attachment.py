@@ -64,7 +64,16 @@ class AutoAttachmentBackend:
         self._refresh_runtime_handles()
         return self._backend_kind in {"legacy_attachment", "fixed_joint"}
 
-    def attach(self, attachment_prim_path: str, parent_rigid_body_path: str, child_rigid_body_path: str) -> str:
+    def attach(
+        self,
+        attachment_prim_path: str,
+        parent_rigid_body_path: str,
+        child_rigid_body_path: str,
+        parent_pos_w: tuple[float, float, float] | None = None,
+        parent_quat_w: tuple[float, float, float, float] | None = None,
+        child_pos_w: tuple[float, float, float] | None = None,
+        child_quat_w: tuple[float, float, float, float] | None = None,
+    ) -> str:
         if not self.cfg.enabled:
             raise RuntimeError("AutoAttachment backend is disabled.")
         if not self.is_available():
@@ -103,9 +112,31 @@ class AutoAttachmentBackend:
             # With multiple robots, anchoring every joint at the child body's origin creates
             # an inconsistent closed loop where all hands try to occupy the same payload point.
             joint = UsdPhysics.FixedJoint.Define(stage, Sdf.Path(attachment_prim_path))
-            xf_cache = UsdGeom.XformCache()
-            parent_pose = xf_cache.GetLocalToWorldTransform(parent_prim).RemoveScaleShear()
-            child_pose = xf_cache.GetLocalToWorldTransform(child_prim).RemoveScaleShear()
+            if (
+                parent_pos_w is not None
+                and parent_quat_w is not None
+                and child_pos_w is not None
+                and child_quat_w is not None
+            ):
+                def _gf_matrix_from_pos_quat(
+                    pos: tuple[float, float, float],
+                    quat_wxyz: tuple[float, float, float, float],
+                ) -> Gf.Matrix4d:
+                    quat = Gf.Quatd(
+                        float(quat_wxyz[0]),
+                        Gf.Vec3d(float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])),
+                    )
+                    matrix = Gf.Matrix4d()
+                    matrix.SetRotate(Gf.Rotation(quat))
+                    matrix.SetTranslateOnly(Gf.Vec3d(float(pos[0]), float(pos[1]), float(pos[2])))
+                    return matrix
+
+                parent_pose = _gf_matrix_from_pos_quat(parent_pos_w, parent_quat_w).RemoveScaleShear()
+                child_pose = _gf_matrix_from_pos_quat(child_pos_w, child_quat_w).RemoveScaleShear()
+            else:
+                xf_cache = UsdGeom.XformCache()
+                parent_pose = xf_cache.GetLocalToWorldTransform(parent_prim).RemoveScaleShear()
+                child_pose = xf_cache.GetLocalToWorldTransform(child_prim).RemoveScaleShear()
             parent_in_child = (parent_pose * child_pose.GetInverse()).RemoveScaleShear()
 
             joint.CreateBody0Rel().SetTargets([Sdf.Path(parent_rigid_body_path)])

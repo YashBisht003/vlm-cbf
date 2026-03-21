@@ -10,9 +10,16 @@ import traceback
 from pathlib import Path
 
 
+def _official_isaaclab_root() -> Path:
+    return Path(__file__).resolve().parents[1] / "third_party" / "IsaacLab"
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SKRL MAPPO bring-up for Isaac no-VLM cooperative transport task.")
     parser.add_argument("--headless", action="store_true", help="Run headless.")
+    parser.add_argument("--video", action="store_true", help="Record a training video via the official Isaac Lab trainer.")
+    parser.add_argument("--video-length", type=int, default=200, help="Recorded video length in environment steps.")
+    parser.add_argument("--video-interval", type=int, default=2000, help="Video recording interval in environment steps.")
     parser.add_argument(
         "--device",
         type=str,
@@ -33,6 +40,11 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Index into the lift payload mass schedule (default 0 -> 6 kg).",
     )
+    parser.add_argument("--lift-preshape-joint2", type=float, default=None, help="Optional lift preshape override for panda_joint2.")
+    parser.add_argument("--lift-preshape-joint4", type=float, default=None, help="Optional lift preshape override for panda_joint4.")
+    parser.add_argument("--lift-preshape-joint6", type=float, default=None, help="Optional lift preshape override for panda_joint6.")
+    parser.add_argument("--lift-arm-stiffness", type=float, default=None, help="Optional lift-stage arm stiffness override.")
+    parser.add_argument("--lift-arm-damping", type=float, default=None, help="Optional lift-stage arm damping override.")
     parser.add_argument("--print-only", action="store_true", help="Print resolved setup and exit.")
     parser.add_argument(
         "--smoke-test",
@@ -96,12 +108,18 @@ def _parse_args() -> argparse.Namespace:
         default=1.0,
         help="Signed magnitude for the selected scripted_lift arm channel.",
     )
+    parser.add_argument(
+        "--smoke-teleport-payload-up",
+        type=float,
+        default=0.0,
+        help="If > 0, manually raise the payload by this many meters once lift_ready becomes true during smoke mode.",
+    )
     return parser.parse_args()
 
 
-def _build_official_command(task_id: str) -> list[str]:
-    return [
-        "isaaclab.sh",
+def _build_official_command(task_id: str, args: argparse.Namespace | None = None) -> list[str]:
+    cmd = [
+        "./isaaclab.sh",
         "-p",
         "scripts/reinforcement_learning/skrl/train.py",
         "--task",
@@ -109,6 +127,35 @@ def _build_official_command(task_id: str) -> list[str]:
         "--algorithm",
         "MAPPO",
     ]
+    if args is None:
+        return cmd
+    if bool(args.headless):
+        cmd.append("--headless")
+    if bool(getattr(args, "video", False)):
+        cmd.append("--video")
+        cmd.extend(["--video_length", str(int(args.video_length))])
+        cmd.extend(["--video_interval", str(int(args.video_interval))])
+    if getattr(args, "num_envs", None) is not None:
+        cmd.extend(["--num_envs", str(int(args.num_envs))])
+    if getattr(args, "device", None):
+        cmd.extend(["--device", str(args.device)])
+    if getattr(args, "max_steps", None) is not None:
+        cmd.extend(["--timesteps", str(int(args.max_steps))])
+    if getattr(args, "curriculum_phase", None):
+        cmd.extend(["--curriculum_phase", str(args.curriculum_phase)])
+    if getattr(args, "lift_mass_level", None) is not None:
+        cmd.extend(["--lift_mass_level", str(int(args.lift_mass_level))])
+    if getattr(args, "lift_preshape_joint2", None) is not None:
+        cmd.extend(["--lift_preshape_joint2", str(float(args.lift_preshape_joint2))])
+    if getattr(args, "lift_preshape_joint4", None) is not None:
+        cmd.extend(["--lift_preshape_joint4", str(float(args.lift_preshape_joint4))])
+    if getattr(args, "lift_preshape_joint6", None) is not None:
+        cmd.extend(["--lift_preshape_joint6", str(float(args.lift_preshape_joint6))])
+    if getattr(args, "lift_arm_stiffness", None) is not None:
+        cmd.extend(["--lift_arm_stiffness", str(float(args.lift_arm_stiffness))])
+    if getattr(args, "lift_arm_damping", None) is not None:
+        cmd.extend(["--lift_arm_damping", str(float(args.lift_arm_damping))])
+    return cmd
 
 
 def _launch_app(args: argparse.Namespace):
@@ -132,20 +179,41 @@ def _load_env(load_isaaclab_env, task_id: str, num_envs: int):
         return load_isaaclab_env(task_name=task_id)
 
 
-def _build_env_cfg(num_envs: int, curriculum_phase: str, device: str, lift_mass_level: int):
+def _build_env_cfg(
+    num_envs: int,
+    curriculum_phase: str,
+    device: str,
+    lift_mass_level: int,
+    lift_preshape_joint2: float | None = None,
+    lift_preshape_joint4: float | None = None,
+    lift_preshape_joint6: float | None = None,
+    lift_arm_stiffness: float | None = None,
+    lift_arm_damping: float | None = None,
+):
     try:
         from .direct_marl_env import NoVlmCoopTransportEnvCfg, NoVlmSceneCfg, SimulationCfg
     except ImportError:
         from direct_marl_env import NoVlmCoopTransportEnvCfg, NoVlmSceneCfg, SimulationCfg
 
     sim_device = "cuda:0" if str(device).strip().lower() == "cuda" else str(device).strip()
-    return NoVlmCoopTransportEnvCfg(
+    cfg = NoVlmCoopTransportEnvCfg(
         scene=NoVlmSceneCfg(num_envs=int(num_envs), env_spacing=8.0),
         device=sim_device,
         sim=SimulationCfg(dt=0.02, device=sim_device),
         curriculum_phase=str(curriculum_phase).strip().lower(),
         lift_payload_mass_level=int(lift_mass_level),
     )
+    if lift_preshape_joint2 is not None:
+        cfg.lift_preshape_joint2_rad = float(lift_preshape_joint2)
+    if lift_preshape_joint4 is not None:
+        cfg.lift_preshape_joint4_rad = float(lift_preshape_joint4)
+    if lift_preshape_joint6 is not None:
+        cfg.lift_preshape_joint6_rad = float(lift_preshape_joint6)
+    if lift_arm_stiffness is not None:
+        cfg.lift_arm_stiffness = float(lift_arm_stiffness)
+    if lift_arm_damping is not None:
+        cfg.lift_arm_damping = float(lift_arm_damping)
+    return cfg
 
 
 def _random_actions(wrapped):
@@ -376,6 +444,28 @@ def _hand_height_stats(raw_env):
     }
 
 
+def _tool_height_stats(raw_env):
+    import torch
+
+    tool_z = []
+    for agent_name in getattr(raw_env, "possible_agents", ()):
+        robot = raw_env._robot_entities.get(agent_name)
+        if robot is None or not hasattr(raw_env, "_tool_body_state"):
+            continue
+        tool_state = raw_env._tool_body_state(robot)
+        if not isinstance(tool_state, torch.Tensor) or tool_state.ndim != 2 or tool_state.shape[1] < 3:
+            continue
+        tool_z.append(tool_state[:, 2].detach().to(device="cpu", dtype=torch.float32).reshape(-1))
+    if not tool_z:
+        return None
+    stacked = torch.stack(tool_z, dim=1)
+    return {
+        "mean": float(torch.mean(stacked).item()),
+        "min": float(torch.min(stacked).item()),
+        "max": float(torch.max(stacked).item()),
+    }
+
+
 def _attachment_stats(raw_env):
     import torch
 
@@ -389,6 +479,52 @@ def _attachment_stats(raw_env):
         "mean": float(torch.mean(vals).item()),
         "max": float(torch.max(vals).item()),
     }
+
+
+def _arm_joint_diagnostics(raw_env, agent_name: str = "robot_0"):
+    import torch
+
+    robot = raw_env._robot_entities.get(agent_name)
+    if robot is None or not hasattr(robot, "data"):
+        return None
+    joint_pos = getattr(robot.data, "joint_pos", None)
+    if not isinstance(joint_pos, torch.Tensor) or joint_pos.ndim != 2 or joint_pos.shape[0] == 0:
+        return None
+
+    joint_names = raw_env._joint_names(robot)
+    arm_ids = raw_env._arm_joint_ids.get(agent_name)
+    arm_hold = raw_env._arm_hold_targets.get(agent_name)
+    arm_id_list = None
+    if isinstance(arm_ids, torch.Tensor):
+        arm_id_list = arm_ids.detach().to(device="cpu", dtype=torch.long).tolist()
+
+    joint_pos_cpu = joint_pos[0].detach().to(device="cpu", dtype=torch.float32)
+    out = {}
+    for joint_name in list(raw_env.cfg.arm_action_joint_names):
+        try:
+            global_idx = joint_names.index(joint_name)
+        except ValueError:
+            out[joint_name] = {"pos": None, "target": None, "arm_offset": None}
+            continue
+        pos_val = float(joint_pos_cpu[global_idx].item())
+        arm_offset = None
+        if arm_id_list is not None and global_idx in arm_id_list:
+            arm_offset = arm_id_list.index(global_idx)
+        target_val = None
+        if (
+            isinstance(arm_hold, torch.Tensor)
+            and arm_hold.ndim == 2
+            and arm_hold.shape[0] > 0
+            and arm_offset is not None
+            and arm_offset < int(arm_hold.shape[1])
+        ):
+            target_val = float(arm_hold[0, arm_offset].detach().to(device="cpu", dtype=torch.float32).item())
+        out[joint_name] = {
+            "pos": round(pos_val, 5),
+            "target": round(target_val, 5) if target_val is not None else None,
+            "arm_offset": arm_offset,
+        }
+    return out
 
 
 def _force_contact_probe_pose(raw_env) -> None:
@@ -435,6 +571,7 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
     if payload_stats is not None and getattr(raw_env, "_payload_entity", None) is not None:
         reset_payload_z = raw_env._safe_root_state(raw_env._payload_entity)[:, 2].detach().to(device="cpu", dtype=torch.float32)
         hand_stats = _hand_height_stats(raw_env)
+        tool_stats = _tool_height_stats(raw_env)
         attach_stats = _attachment_stats(raw_env)
         print(
             "[smoke] payload z start mean {:.6f} | min {:.6f} | max {:.6f}".format(
@@ -444,18 +581,22 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
             ),
             flush=True,
         )
-        if hand_stats is not None or attach_stats is not None:
+        if hand_stats is not None or tool_stats is not None or attach_stats is not None:
             hand_suffix = ""
             if hand_stats is not None:
                 hand_suffix = " | hand z mean {:.6f}".format(hand_stats["mean"])
+            tool_suffix = ""
+            if tool_stats is not None:
+                tool_suffix = " | tool z mean {:.6f}".format(tool_stats["mean"])
             attach_suffix = ""
             if attach_stats is not None:
                 attach_suffix = " | attachments mean {:.2f}".format(attach_stats["mean"])
-            print(f"[smoke] start diagnostics{hand_suffix}{attach_suffix}", flush=True)
+            print(f"[smoke] start diagnostics{hand_suffix}{tool_suffix}{attach_suffix}", flush=True)
 
     nonzero_seen = False
     max_force_seen = 0.0
     t0 = time.time()
+    teleport_done = False
     for step in range(int(args.smoke_steps)):
         if args.smoke_policy == "scripted_phase":
             actions = _scripted_phase_policy_actions(wrapped, raw_env)
@@ -481,6 +622,7 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
                     live_baseline_z = live_baseline_z.detach().to(device="cpu", dtype=torch.float32)
                 payload_stats = _payload_height_stats(raw_env, reset_z=live_baseline_z)
                 hand_stats = _hand_height_stats(raw_env)
+                tool_stats = _tool_height_stats(raw_env)
                 attach_stats = _attachment_stats(raw_env)
                 phase_ids = getattr(getattr(raw_env, "_phase_mgr", None), "phase_ids", None)
                 phase_suffix = ""
@@ -503,11 +645,14 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
                 hand_suffix = ""
                 if hand_stats is not None:
                     hand_suffix = " | hand z mean {:.6f}".format(hand_stats["mean"])
+                tool_suffix = ""
+                if tool_stats is not None:
+                    tool_suffix = " | tool z mean {:.6f}".format(tool_stats["mean"])
                 attach_suffix = ""
                 if attach_stats is not None:
                     attach_suffix = " | attachments mean {:.2f}".format(attach_stats["mean"])
                 print(
-                    "[smoke] step {}/{} | contact mean {:.6f} | contact max {:.6f} | nonzero {}/{}{}{}{}{}{}".format(
+                    "[smoke] step {}/{} | contact mean {:.6f} | contact max {:.6f} | nonzero {}/{}{}{}{}{}{}{}".format(
                         step + 1,
                         int(args.smoke_steps),
                         stats["mean"],
@@ -516,11 +661,89 @@ def _run_smoke_test(wrapped, raw_env, args: argparse.Namespace) -> None:
                         stats["total"],
                         payload_suffix,
                         hand_suffix,
+                        tool_suffix,
                         attach_suffix,
                         phase_suffix,
                         settle_suffix,
                     )
                 , flush=True)
+                if args.smoke_policy == "scripted_lift":
+                    arm_diag = _arm_joint_diagnostics(raw_env)
+                    if arm_diag is not None:
+                        diag_str = " | ".join(
+                            f"{joint_name}: pos={vals['pos']} tgt={vals['target']} off={vals['arm_offset']}"
+                            for joint_name, vals in arm_diag.items()
+                        )
+                        print(f"[smoke] arm_diag {diag_str}", flush=True)
+                env_log = getattr(raw_env, "extras", {}).get("log", {})
+                if isinstance(env_log, dict) and env_log:
+                    selected_keys = (
+                        "lift/progress_mean",
+                        "lift/shaping_mean",
+                        "payload/dz_mean",
+                        "lift/attachments_mean",
+                        "base/root_z_mean",
+                        "base/upright_mean",
+                        "base/upright_min",
+                        "base/upside_down_frac",
+                        "belief/mass_mean_kg",
+                        "control/panda_joint4_pos_mean",
+                        "control/panda_joint4_target_mean",
+                    )
+                    parts = []
+                    for key in selected_keys:
+                        value = env_log.get(key)
+                        if isinstance(value, torch.Tensor) and value.numel() == 1:
+                            parts.append(f"{key}={float(value.detach().to(device='cpu').item()):.6f}")
+                    if parts:
+                        print(f"[smoke] env_log {' | '.join(parts)}", flush=True)
+                if (
+                    (not teleport_done)
+                    and float(args.smoke_teleport_payload_up) > 0.0
+                    and isinstance(lift_ready, torch.Tensor)
+                    and lift_ready.numel() > 0
+                    and bool(torch.all(lift_ready).item())
+                    and getattr(raw_env, "_payload_entity", None) is not None
+                ):
+                    env_ids = torch.arange(raw_env.num_envs, dtype=torch.long, device=raw_env.device)
+                    payload_root = raw_env._safe_root_state(raw_env._payload_entity).clone()
+                    payload_root[:, 2] += float(args.smoke_teleport_payload_up)
+                    raw_env._payload_entity.write_root_pose_to_sim(payload_root[:, :7], env_ids=env_ids)
+                    raw_env._payload_entity.write_root_velocity_to_sim(
+                        torch.zeros((raw_env.num_envs, 6), dtype=torch.float32, device=raw_env.device),
+                        env_ids=env_ids,
+                    )
+                    if hasattr(raw_env._payload_entity, "write_data_to_sim"):
+                        raw_env._payload_entity.write_data_to_sim()
+                    raw_env.scene.write_data_to_sim()
+                    raw_env._refresh_entity_buffers()
+                    payload_z = raw_env._safe_root_state(raw_env._payload_entity)[:, 2]
+                    lift_delta_z, lift_ready_mask = raw_env._lift_progress_state(payload_z)
+                    lift_progress = torch.clamp(
+                        lift_delta_z / float(max(1.0e-6, raw_env.cfg.lift_height_m)),
+                        min=0.0,
+                        max=1.0,
+                    )
+                    in_lift_mask = (
+                        raw_env._phase_mgr.phase_ids
+                        == int(raw_env._phase_mgr.phase_ids.new_tensor(int(raw_env._phase_mgr.phase_ids[0].item())))
+                    )
+                    lift_shaping = (
+                        0.05
+                        * in_lift_mask.to(dtype=torch.float32)
+                        * lift_ready_mask.to(dtype=torch.float32)
+                        * lift_progress
+                    )
+                    print(
+                        "[smoke] teleport_check dz+{:.3f} | payload z mean {:.6f} | lift_progress mean {:.6f} | lift_shaping mean {:.6f}".format(
+                            float(args.smoke_teleport_payload_up),
+                            float(torch.mean(payload_z).item()),
+                            float(torch.mean(lift_progress).item()),
+                            float(torch.mean(lift_shaping).item()),
+                        ),
+                        flush=True,
+                    )
+                    teleport_done = True
     elapsed = time.time() - t0
     print(f"[smoke] finished in {elapsed:.2f}s", flush=True)
     print(f"[smoke] contact non-zero seen: {nonzero_seen} (max={max_force_seen:.6f})", flush=True)
@@ -550,7 +773,8 @@ def main() -> None:
         from task_registry import TASK_ID, registration_summary
 
     script_check = check_script()
-    official_cmd = _build_official_command(TASK_ID)
+    official_cmd = _build_official_command(TASK_ID, args)
+    official_cwd = _official_isaaclab_root()
     reg = (
         registration_summary(force=True)
         if args.print_only
@@ -568,15 +792,27 @@ def main() -> None:
         "requested_num_envs": int(args.num_envs),
         "requested_max_steps": int(args.max_steps),
         "requested_device": str(args.device),
+        "video": bool(args.video),
+        "video_length": int(args.video_length),
+        "video_interval": int(args.video_interval),
         "curriculum_phase": str(args.curriculum_phase),
         "lift_mass_level": int(args.lift_mass_level),
-        "official_train_command": " ".join(official_cmd + (["--headless"] if args.headless else [])),
+        "lift_preshape_joint2": args.lift_preshape_joint2,
+        "lift_preshape_joint4": args.lift_preshape_joint4,
+        "lift_preshape_joint6": args.lift_preshape_joint6,
+        "lift_arm_stiffness": args.lift_arm_stiffness,
+        "lift_arm_damping": args.lift_arm_damping,
+        "official_train_command": " ".join(official_cmd),
+        "official_train_cwd": str(official_cwd),
         "cwd": str(Path.cwd()),
     }
     print(json.dumps(payload, indent=2), flush=True)
 
     if args.print_only:
         return
+
+    if (not args.smoke_test) and (not args.run_official_script):
+        args.run_official_script = True
 
     # Preferred path: official Isaac Lab SKRL script.
     if args.run_official_script:
@@ -585,8 +821,7 @@ def main() -> None:
                 "Preflight failed: installed Isaac Lab SKRL train.py appears susceptible to '--algorithm' NameError. "
                 "Patch train.py first or update installation."
             )
-        cmd = official_cmd + (["--headless"] if args.headless else [])
-        subprocess.run(cmd, check=True, cwd=os.getcwd())
+        subprocess.run(official_cmd, check=True, cwd=str(official_cwd))
         return
 
     # Local bootstrap path for quick validation.
@@ -611,6 +846,11 @@ def main() -> None:
             curriculum_phase=str(args.curriculum_phase),
             device=str(args.device),
             lift_mass_level=int(args.lift_mass_level),
+            lift_preshape_joint2=args.lift_preshape_joint2,
+            lift_preshape_joint4=args.lift_preshape_joint4,
+            lift_preshape_joint6=args.lift_preshape_joint6,
+            lift_arm_stiffness=args.lift_arm_stiffness,
+            lift_arm_damping=args.lift_arm_damping,
         )
         if args.smoke_test:
             env_cfg.debug_belief_steps = max(0, int(args.smoke_ekf_debug_steps))

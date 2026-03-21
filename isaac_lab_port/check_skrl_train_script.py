@@ -9,6 +9,7 @@ from pathlib import Path
 def _candidate_paths() -> list[Path]:
     candidates: list[Path] = []
     rel = Path("scripts/reinforcement_learning/skrl/train.py")
+    vendored_rel = Path("third_party/IsaacLab") / rel
 
     for env_key in ("ISAACLAB_PATH", "ISAAC_LAB_PATH"):
         root = os.environ.get(env_key, "").strip()
@@ -17,8 +18,10 @@ def _candidate_paths() -> list[Path]:
 
     cwd = Path.cwd().resolve()
     candidates.append(cwd / rel)
+    candidates.append(cwd / vendored_rel)
     for parent in cwd.parents:
         candidates.append(parent / rel)
+        candidates.append(parent / vendored_rel)
 
     uniq: list[Path] = []
     seen = set()
@@ -79,4 +82,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

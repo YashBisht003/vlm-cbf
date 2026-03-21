@@ -15,6 +15,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true", help="Run headless.")
     parser.add_argument("--max-steps", type=int, default=100_000, help="Max training timesteps (for metadata only).")
     parser.add_argument("--num-envs", type=int, default=128, help="Requested env count (for metadata only).")
+    parser.add_argument(
+        "--curriculum-phase",
+        choices=("full", "approach", "contact", "probe", "lift"),
+        default="full",
+        help="Optional curriculum start phase for env resets.",
+    )
     parser.add_argument("--print-only", action="store_true", help="Print resolved setup and exit.")
     parser.add_argument(
         "--smoke-test",
@@ -102,7 +108,7 @@ def _load_env(load_isaaclab_env, task_id: str, num_envs: int):
         return load_isaaclab_env(task_name=task_id)
 
 
-def _build_env_cfg(num_envs: int):
+def _build_env_cfg(num_envs: int, curriculum_phase: str):
     try:
         from .direct_marl_env import NoVlmCoopTransportEnvCfg, NoVlmSceneCfg, SimulationCfg
     except ImportError:
@@ -113,6 +119,7 @@ def _build_env_cfg(num_envs: int):
         scene=NoVlmSceneCfg(num_envs=int(num_envs), env_spacing=8.0),
         device=device,
         sim=SimulationCfg(dt=0.02, device=device),
+        curriculum_phase=str(curriculum_phase).strip().lower(),
     )
 
 
@@ -382,6 +389,7 @@ def main() -> None:
         "task_id": TASK_ID,
         "requested_num_envs": int(args.num_envs),
         "requested_max_steps": int(args.max_steps),
+        "curriculum_phase": str(args.curriculum_phase),
         "official_train_command": " ".join(official_cmd + (["--headless"] if args.headless else [])),
         "cwd": str(Path.cwd()),
     }
@@ -418,7 +426,7 @@ def main() -> None:
         ) from exc
 
     try:
-        env_cfg = _build_env_cfg(num_envs=int(args.num_envs))
+        env_cfg = _build_env_cfg(num_envs=int(args.num_envs), curriculum_phase=str(args.curriculum_phase))
         if args.smoke_test:
             env_cfg.debug_belief_steps = max(0, int(args.smoke_ekf_debug_steps))
             env_cfg.debug_cbf_steps = max(0, int(args.smoke_ekf_debug_steps))

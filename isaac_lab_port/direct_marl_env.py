@@ -486,6 +486,9 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
     cbf_recovery_gain: float = 0.5
     cbf_enable_after_s: float = 0.0
     cbf_warmup_s: float = 2.0
+    curriculum_phase: str = "full"
+    curriculum_use_stage_cbf_schedule: bool = True
+    curriculum_face_margin_m: float = 0.15
     cbf_dmin_com_gain: float = 1.0
     cbf_alpha_mass_gain: float = 2.0
     cbf_speed_mass_gain: float = 1.0
@@ -494,6 +497,7 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
     probe_hold_s: float = 0.25
     probe_belief_com_threshold_m: float = 0.03
     probe_belief_mass_rel_threshold: float = 0.05
+    regrip_hold_s: float = 0.5
     grip_attach_threshold: float = 0.25
     grip_release_threshold: float = -0.25
     grip_consensus_release_votes: int = 2
@@ -534,6 +538,12 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
             raise ValueError("Current scaffold supports exactly 4 robots.")
         if self.wheel_radius_m <= 0.0:
             raise ValueError("wheel_radius_m must be > 0.")
+        phase = str(self.curriculum_phase).strip().lower()
+        if phase not in {"full", "approach", "contact", "probe", "lift"}:
+            raise ValueError("curriculum_phase must be one of: full, approach, contact, probe, lift.")
+        self.curriculum_phase = phase
+        if self.curriculum_face_margin_m < 0.0:
+            raise ValueError("curriculum_face_margin_m must be >= 0.")
         self.sim.device = str(self.device)
         if not self.possible_agents:
             self.possible_agents = _agent_names(self.num_robots)
@@ -556,9 +566,11 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self.possible_agents = list(cfg.possible_agents)
         self._num_envs = int(cfg.scene.num_envs)
         self._device = torch.device(cfg.device)
+        self._curriculum_phase = str(cfg.curriculum_phase).strip().lower()
         self._belief_ekf: List[BeliefEKF] = []
         self._neural_cbf_runtime: Optional[NeuralCbfRuntime] = None
         self._residual_runtime: Optional[ResidualCorrectorRuntime] = None
+        self._agent_index = {name: idx for idx, name in enumerate(self.possible_agents)}
         self._last_actions = {
             agent: torch.zeros((self._num_envs, AGENT_ACT_DIM), dtype=torch.float32, device=self._device)
             for agent in self.possible_agents
@@ -572,6 +584,9 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._attachment_runtime_available = bool(self._attachment_backend.is_available())
         self._attachments: dict[tuple[int, str], str] = {}
         self._attachment_count_buf = torch.zeros(self._num_envs, dtype=torch.int32, device=self._device)
+        self._attachment_mask = torch.zeros(
+            (self._num_envs, len(self.possible_agents)), dtype=torch.bool, device=self._device
+        )
         self._robot_entities: dict[str, Articulation] = {}
         self._payload_entity: RigidObject | None = None
         self._contact_sensors: dict[str, object] = {}
@@ -595,6 +610,12 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._belief_force_ema = torch.zeros(
             (self._num_envs, len(self.possible_agents)), dtype=torch.float32, device=self._device
         )
+        self._belief_dirty = True
+        (
+            self._active_use_cbf,
+            self._active_cbf_enable_after_s,
+            self._active_cbf_warmup_s,
+        ) = self._resolve_active_cbf_schedule()
         self._cbf_slack = torch.zeros((self._num_envs, len(self.possible_agents)), dtype=torch.float32, device=self._device)
         self._cbf_applied = torch.zeros((self._num_envs, len(self.possible_agents)), dtype=torch.bool, device=self._device)
         self._neural_barrier = torch.zeros((self._num_envs, len(self.possible_agents)), dtype=torch.float32, device=self._device)
@@ -957,6 +978,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             path = self._attachments.pop(key)
             self._attachment_backend.detach(path)
         self._attachment_count_buf[env_ids] = 0
+        self._attachment_mask[env_ids] = False
 
     def _reset_belief_idx(self, env_ids: torch.Tensor) -> None:
         dims = np.asarray(self.cfg.payload_dims_m, dtype=np.float32)
@@ -974,6 +996,115 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             self._belief_ekf[int(env_id)] = ekf
         self._sync_belief_tensors()
 
+    def _refresh_attachment_runtime_available(self) -> bool:
+        self._attachment_runtime_available = bool(self._attachment_backend.is_available())
+        return self._attachment_runtime_available
+
+    def _resolve_active_cbf_schedule(self) -> tuple[bool, float, float]:
+        raw_enable_after = max(0.0, float(self.cfg.cbf_enable_after_s))
+        raw_warmup = max(0.0, float(self.cfg.cbf_warmup_s))
+        if not bool(self.cfg.use_cbf):
+            return False, raw_enable_after, raw_warmup
+        if not bool(getattr(self.cfg, "curriculum_use_stage_cbf_schedule", True)):
+            return True, raw_enable_after, raw_warmup
+        if self._curriculum_phase == "lift":
+            return False, 0.0, 0.0
+        if self._curriculum_phase == "probe":
+            return True, 0.5, 1.5
+        if self._curriculum_phase == "contact":
+            return True, 0.25, 1.0
+        return True, 0.0, 1.0
+
+    def _yaw_to_quaternion(self, yaw: torch.Tensor) -> torch.Tensor:
+        half = 0.5 * yaw.to(device=self._device, dtype=torch.float32)
+        quat = torch.zeros((yaw.shape[0], 4), dtype=torch.float32, device=self._device)
+        quat[:, 0] = torch.cos(half)
+        quat[:, 3] = torch.sin(half)
+        return quat
+
+    def _write_root_pose_xy_yaw(
+        self,
+        entity,
+        env_ids: torch.Tensor,
+        xy_world: torch.Tensor,
+        yaw_world: torch.Tensor,
+    ) -> None:
+        if entity is None or env_ids.numel() == 0:
+            return
+        root_state = self._safe_root_state(entity)[env_ids].clone()
+        root_state[:, 0:2] = xy_world.to(device=self._device, dtype=torch.float32)
+        root_state[:, 3:7] = self._yaw_to_quaternion(yaw_world.reshape(-1))
+        root_state[:, 7:13] = 0.0
+        if hasattr(entity, "write_root_pose_to_sim"):
+            entity.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
+        if hasattr(entity, "write_root_velocity_to_sim"):
+            entity.write_root_velocity_to_sim(root_state[:, 7:13], env_ids=env_ids)
+        if hasattr(entity, "write_data_to_sim"):
+            entity.write_data_to_sim()
+
+    def _layout_curriculum_robots(self, env_ids: torch.Tensor) -> None:
+        if env_ids.numel() == 0 or self._payload_entity is None:
+            return
+        payload_xy = self._safe_root_state(self._payload_entity)[env_ids, 0:2]
+        half_x = 0.5 * float(self.cfg.payload_dims_m[0])
+        half_y = 0.5 * float(self.cfg.payload_dims_m[1])
+        margin = float(max(0.0, self.cfg.curriculum_face_margin_m))
+        offsets = torch.tensor(
+            [
+                [half_x + margin, 0.0],
+                [-(half_x + margin), 0.0],
+                [0.0, half_y + margin],
+                [0.0, -(half_y + margin)],
+            ],
+            dtype=torch.float32,
+            device=self._device,
+        )
+        yaws = torch.tensor([np.pi, 0.0, -0.5 * np.pi, 0.5 * np.pi], dtype=torch.float32, device=self._device)
+        for agent_idx, agent_name in enumerate(self.possible_agents):
+            robot = self._robot_entities.get(agent_name)
+            if robot is None:
+                continue
+            xy_world = payload_xy + offsets[agent_idx].view(1, 2)
+            yaw_world = yaws[agent_idx].repeat(env_ids.numel())
+            self._write_root_pose_xy_yaw(robot, env_ids, xy_world, yaw_world)
+        if hasattr(self.scene, "write_data_to_sim"):
+            self.scene.write_data_to_sim()
+
+    def _apply_curriculum_reset(self, env_ids: torch.Tensor) -> None:
+        if env_ids.numel() == 0:
+            return
+        phase_name = self._curriculum_phase
+        if phase_name in {"full", "approach"}:
+            return
+
+        if phase_name == "lift":
+            if not self._refresh_attachment_runtime_available():
+                raise RuntimeError("Lift curriculum requires the PhysX attachment runtime to be available.")
+            env_list = env_ids.detach().to(device="cpu", dtype=torch.long).tolist()
+            try:
+                for env_id in env_list:
+                    for agent_name in self.possible_agents:
+                        self._attach_vacuum(
+                            int(env_id),
+                            agent_name,
+                            self._robot_hand_prim_path(int(env_id), agent_name),
+                            self._payload_prim_path(int(env_id)),
+                        )
+            except Exception as exc:
+                self._clear_env_attachments(env_ids)
+                raise RuntimeError(f"Failed to pre-attach lift curriculum envs: {exc}") from exc
+
+        start_phase = {
+            "contact": Phase.CONTACT,
+            "probe": Phase.PROBE,
+            "lift": Phase.LIFT,
+        }.get(phase_name)
+        if start_phase is None:
+            return
+        self._phase_mgr.phase_ids[env_ids] = int(PHASE_TO_ID[start_phase])
+        self._phase_mgr.phase_started_at_s[env_ids] = 0.0
+        self._phase_mgr.contact_all_attached_since_s[env_ids] = -1.0
+
     def _reset_idx(self, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0:
             return
@@ -981,6 +1112,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._all_attached_mask[env_ids] = False
         self._base_contact_force_n[env_ids] = 0.0
         self._attachment_count_buf[env_ids] = 0
+        self._attachment_mask[env_ids] = False
         self._belief_force_ema[env_ids] = 0.0
         for robot in self._robot_entities.values():
             self._reset_articulation(robot, env_ids)
@@ -993,6 +1125,8 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._neural_barrier[env_ids] = 0.0
         self._residual_goal_offset[env_ids] = 0.0
         self._phase_mgr.reset(now_s=0.0, env_ids=env_ids.detach().to("cpu").tolist())
+        self._apply_curriculum_reset(env_ids)
+        self._belief_dirty = True
 
     def _pre_physics_step(self, actions: Dict[str, torch.Tensor]) -> None:
         for name in self.possible_agents:
@@ -1002,6 +1136,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             if act.ndim != 2 or act.shape[1] != AGENT_ACT_DIM:
                 raise ValueError(f"Action tensor for {name} must be [num_envs, {AGENT_ACT_DIM}]")
             self._last_actions[name] = torch.clamp(act, -1.0, 1.0)
+        self._belief_dirty = True
 
     def _cbf_extra_constraint(
         self,
@@ -1039,8 +1174,8 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
     def _cbf_activation_scale(self, env_id: int) -> float:
         step_dt = float(self.cfg.sim.dt) * float(max(1, int(self.cfg.decimation)))
         elapsed_s = float(self.episode_length_buf[env_id].item()) * step_dt
-        enable_after = max(0.0, float(self.cfg.cbf_enable_after_s))
-        warmup = max(0.0, float(self.cfg.cbf_warmup_s))
+        enable_after = max(0.0, float(self._active_cbf_enable_after_s))
+        warmup = max(0.0, float(self._active_cbf_warmup_s))
         if elapsed_s <= enable_after:
             return 0.0
         if warmup <= 1.0e-6:
@@ -1147,7 +1282,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         )
 
     def _apply_cbf_filter(self, commands: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        if not bool(self.cfg.use_cbf):
+        if not bool(self._active_use_cbf):
             return commands
         filtered = {name: cmd.clone() for name, cmd in commands.items()}
         robot_state = {
@@ -1312,6 +1447,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._process_grip_actions()
 
     def _phase_inputs(self) -> TorchBatchedPhaseInputs:
+        self._refresh_attachment_runtime_available()
         distance_by_agent = self._robot_payload_distances()
         contact_by_agent = {
             name: self._safe_contact_force_norm(self._robot_entities[name])
@@ -1357,9 +1493,12 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             & (probe_elapsed_s >= float(max(0.0, self.cfg.probe_hold_s)))
         )
         correct_done = torch.zeros_like(probe_done, dtype=torch.bool)
-        regrip_done = all_attached & (
+        regrip_phase_id = int(PHASE_TO_ID[Phase.REGRIP])
+        in_regrip = self._phase_mgr.phase_ids == regrip_phase_id
+        regrip_elapsed_s = now_s - self._phase_mgr.phase_started_at_s
+        regrip_done = in_regrip & all_attached & (
             torch.std(contact_forces, dim=1, unbiased=False) <= float(self.cfg.regrip_balance_std_n)
-        )
+        ) & (regrip_elapsed_s >= float(max(0.0, self.cfg.regrip_hold_s)))
         lift_done = payload_z >= float(self.cfg.lift_height_m)
         transport_done = lift_done & (goal_dist <= float(self.cfg.goal_tolerance_m))
         place_done = transport_done & (payload_z <= float(self.cfg.place_height_m))
@@ -1427,11 +1566,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         return torch.cat([pos_xy, yaw, lin_xy, ang_z], dim=1)  # [N, 6]
 
     def _attachment_mask_for_agent(self, agent_name: str) -> torch.Tensor:
-        mask = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
-        for env_id in range(self._num_envs):
-            if (int(env_id), str(agent_name)) in self._attachments:
-                mask[env_id] = True
-        return mask
+        return self._attachment_mask[:, int(self._agent_index[agent_name])]
 
     def _attachment_count_fraction(self) -> torch.Tensor:
         return torch.clamp(
@@ -1448,7 +1583,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         return f"/World/envs/env_{int(env_id)}/Payload"
 
     def _process_grip_actions(self) -> None:
-        if not self._attachment_runtime_available:
+        if not self._refresh_attachment_runtime_available():
             return
 
         phase_ids = self._phase_mgr.phase_ids
@@ -1506,7 +1641,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 )
 
     def _detach_overloaded_attachments(self) -> None:
-        if not self._attachment_runtime_available:
+        if not self._refresh_attachment_runtime_available():
             return
         overload_limit = float(self.cfg.contact_force_overload_n)
         for agent_name in self.possible_agents:
@@ -1524,6 +1659,8 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
 
     def _update_belief_state(self) -> None:
         if not bool(self.cfg.use_belief_ekf) or not self._belief_ekf:
+            return
+        if not bool(self._belief_dirty):
             return
         payload_xy = self._payload_features()[:, 0:2].detach().to(device="cpu", dtype=torch.float32).numpy()
         robot_xy = []
@@ -1571,6 +1708,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 )
         self._sync_belief_tensors()
         self._maybe_debug_belief(smoothed_force_arr)
+        self._belief_dirty = False
 
     def _residual_features(self, env_id: int, agent_idx: int, radial_xy: np.ndarray) -> np.ndarray:
         radial = np.asarray(radial_xy, dtype=np.float32).reshape(2)
@@ -1810,6 +1948,7 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         self._attachments[key] = attachment_path
         if 0 <= int(env_id) < self._num_envs:
             self._attachment_count_buf[int(env_id)] += 1
+            self._attachment_mask[int(env_id), int(self._agent_index[agent_name])] = True
 
     def _detach_vacuum(self, env_id: int, agent_name: str) -> None:
         key = (int(env_id), str(agent_name))
@@ -1822,3 +1961,4 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 self._attachment_count_buf[int(env_id)] - 1,
                 min=0,
             )
+            self._attachment_mask[int(env_id), int(self._agent_index[agent_name])] = False

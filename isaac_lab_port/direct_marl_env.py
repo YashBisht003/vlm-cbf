@@ -557,11 +557,7 @@ class NoVlmCoopTransportEnvCfg(DirectMARLEnvCfg):
     lift_settle_steps: int = 2
     lift_arm_stiffness: float = 800.0
     lift_arm_damping: float = 80.0
-    lift_preshape_joint2_rad: float = -1.2
-    lift_preshape_joint4_rad: float = -2.0
-    lift_preshape_joint6_rad: float = 1.6
     lift_reset_standoff_m: float = 0.25
-    lift_attach_delay_steps: int = 4
     lift_payload_mass_levels_kg: tuple[float, ...] = (6.0, 8.0, 10.0)
     lift_payload_mass_level: int = 0
     lift_contact_only: bool = False
@@ -1421,79 +1417,6 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             return body_state[:, body_idx, :].to(device=self._device, dtype=torch.float32)
         return None
 
-    def _set_lift_arm_posture(self, env_ids: torch.Tensor) -> None:
-        lift_joint_targets = {
-            "panda_joint1": 0.0,
-            "panda_joint2": float(self.cfg.lift_preshape_joint2_rad),
-            "panda_joint3": 0.0,
-            "panda_joint4": float(self.cfg.lift_preshape_joint4_rad),
-            "panda_joint5": 0.0,
-            "panda_joint6": float(self.cfg.lift_preshape_joint6_rad),
-            "panda_joint7": 0.8,
-            "panda_finger_joint1": 0.04,
-            "panda_finger_joint2": 0.04,
-        }
-        for agent_name, robot in self._robot_entities.items():
-            if robot is None or not hasattr(robot, "data") or not hasattr(robot.data, "default_joint_pos"):
-                continue
-            joint_names = self._joint_names(robot)
-            default_joint_pos = robot.data.default_joint_pos.to(device=self._device, dtype=torch.float32)
-            if default_joint_pos.shape[0] == 1 and env_ids.numel() > 1:
-                joint_pos = default_joint_pos.repeat(env_ids.numel(), 1)
-            else:
-                joint_pos = default_joint_pos[env_ids].clone()
-            joint_vel = torch.zeros_like(joint_pos)
-            for joint_name, target in lift_joint_targets.items():
-                try:
-                    joint_idx = joint_names.index(joint_name)
-                except ValueError:
-                    continue
-                joint_pos[:, joint_idx] = float(target)
-            if hasattr(robot, "write_joint_state_to_sim"):
-                robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-            if hasattr(robot, "write_data_to_sim"):
-                robot.write_data_to_sim()
-            arm_ids = self._arm_joint_ids.get(agent_name)
-            if arm_ids is not None and arm_ids.numel() > 0:
-                arm_targets = joint_pos[:, arm_ids].clone()
-                self._arm_default_targets[agent_name] = arm_targets
-                self._arm_hold_targets[agent_name] = arm_targets
-
-    def _apply_lift_hold_targets(self, env_ids: torch.Tensor) -> None:
-        if env_ids.numel() == 0:
-            return
-        for agent_name, robot in self._robot_entities.items():
-            if robot is None:
-                continue
-            arm_ids = self._arm_joint_ids.get(agent_name)
-            arm_hold = self._arm_hold_targets.get(agent_name)
-            if arm_ids is not None and arm_hold is not None and arm_hold.shape[1] == int(arm_ids.numel()):
-                self._set_joint_position_target(robot, arm_hold[env_ids], arm_ids)
-            base_ids = self._base_joint_ids.get(agent_name)
-            if base_ids is not None and int(base_ids.numel()) > 0:
-                zeros = torch.zeros((env_ids.numel(), int(base_ids.numel())), dtype=torch.float32, device=self._device)
-                self._set_joint_velocity_target(robot, zeros, base_ids)
-            if hasattr(robot, "write_data_to_sim"):
-                robot.write_data_to_sim()
-
-    def _hidden_physics_steps(self, num_steps: int) -> None:
-        steps = max(0, int(num_steps))
-        if steps <= 0:
-            self._sync_scene_kinematics()
-            return
-        sim_dt = float(getattr(self, "physics_dt", float(self.cfg.sim.dt)))
-        for _ in range(steps):
-            if hasattr(self.scene, "write_data_to_sim"):
-                self.scene.write_data_to_sim()
-            if hasattr(self.sim, "step"):
-                try:
-                    self.sim.step(render=False)
-                except TypeError:
-                    self.sim.step()
-            if hasattr(self.scene, "update"):
-                self.scene.update(dt=sim_dt)
-            self._refresh_entity_buffers()
-
     def _create_stage0_lift_attachments(self, env_ids: torch.Tensor) -> None:
         if env_ids.numel() == 0 or self._lift_uses_contact_only():
             return
@@ -1569,71 +1492,6 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         if hasattr(self._payload_entity, "write_data_to_sim"):
             self._payload_entity.write_data_to_sim()
 
-    def _stage_payload_out_of_way(self, env_ids: torch.Tensor, z_height: float = 2.0) -> None:
-        if env_ids.numel() == 0 or self._payload_entity is None:
-            return
-        root_state = self._safe_root_state(self._payload_entity)[env_ids].clone()
-        root_state[:, 2] = float(z_height)
-        root_state[:, 3] = 1.0
-        root_state[:, 4:7] = 0.0
-        root_state[:, 7:13] = 0.0
-        if hasattr(self._payload_entity, "write_root_pose_to_sim"):
-            self._payload_entity.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
-        if hasattr(self._payload_entity, "write_root_velocity_to_sim"):
-            self._payload_entity.write_root_velocity_to_sim(root_state[:, 7:13], env_ids=env_ids)
-        if hasattr(self._payload_entity, "write_data_to_sim"):
-            self._payload_entity.write_data_to_sim()
-
-    def _align_lift_hands_to_payload_faces(self, env_ids: torch.Tensor) -> None:
-        if env_ids.numel() == 0 or self._payload_entity is None:
-            return
-        payload_xy = self._safe_root_state(self._payload_entity)[env_ids, 0:2]
-        half_x = 0.5 * float(self.cfg.payload_dims_m[0])
-        half_y = 0.5 * float(self.cfg.payload_dims_m[1])
-        desired_offsets = torch.tensor(
-            [
-                [half_x, 0.0],
-                [-half_x, 0.0],
-                [0.0, half_y],
-                [0.0, -half_y],
-            ],
-            dtype=torch.float32,
-            device=self._device,
-        )
-        if self._lift_uses_contact_only():
-            preload = float(max(0.0, getattr(self.cfg, "lift_contact_preload_m", 0.0)))
-            if preload > 0.0:
-                desired_offsets = desired_offsets.clone()
-                for row_idx in range(int(desired_offsets.shape[0])):
-                    if abs(float(desired_offsets[row_idx, 0].item())) > 0.0:
-                        desired_offsets[row_idx, 0] = torch.sign(desired_offsets[row_idx, 0]) * max(
-                            abs(float(desired_offsets[row_idx, 0].item())) - preload,
-                            0.0,
-                        )
-                    if abs(float(desired_offsets[row_idx, 1].item())) > 0.0:
-                        desired_offsets[row_idx, 1] = torch.sign(desired_offsets[row_idx, 1]) * max(
-                            abs(float(desired_offsets[row_idx, 1].item())) - preload,
-                            0.0,
-        )
-        for agent_idx, agent_name in enumerate(self.possible_agents):
-            robot = self._robot_entities.get(agent_name)
-            tool_state = self._tool_body_state(robot)
-            if robot is None or tool_state is None:
-                continue
-            desired_hand_xy = payload_xy + desired_offsets[agent_idx].view(1, 2)
-            delta_xy = desired_hand_xy - tool_state[env_ids, 0:2]
-            if self._curriculum_phase != "lift" and self._shift_planar_base_xy(robot, env_ids, delta_xy):
-                continue
-            root_state = self._safe_root_state(robot)[env_ids].clone()
-            root_state[:, 0:2] += delta_xy
-            root_state[:, 7:13] = 0.0
-            if hasattr(robot, "write_root_pose_to_sim"):
-                robot.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
-            if hasattr(robot, "write_root_velocity_to_sim"):
-                robot.write_root_velocity_to_sim(root_state[:, 7:13], env_ids=env_ids)
-            if hasattr(robot, "write_data_to_sim"):
-                robot.write_data_to_sim()
-
     def _layout_curriculum_robots(self, env_ids: torch.Tensor, margin_override: float | None = None) -> None:
         if env_ids.numel() == 0 or self._payload_entity is None:
             return
@@ -1675,14 +1533,9 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
             return
 
         if phase_name == "lift":
-            self._set_lift_arm_posture(env_ids)
             self._set_lift_arm_gains(env_ids)
             self._place_payload_on_ground(env_ids)
             self._layout_curriculum_robots(env_ids, margin_override=self.cfg.lift_reset_standoff_m)
-            self._sync_scene_kinematics()
-            self._apply_lift_hold_targets(env_ids)
-            self._sync_scene_kinematics()
-            self._align_lift_hands_to_payload_faces(env_ids)
             self._sync_scene_kinematics()
             self._create_stage0_lift_attachments(env_ids)
             self._pending_lift_payload_wait_steps[env_ids] = 0
@@ -2430,8 +2283,6 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         )
         self._place_payload_on_ground(ready_payload_envs)
         self._refresh_entity_buffers()
-        self._align_lift_hands_to_payload_faces(ready_payload_envs)
-        self._refresh_entity_buffers()
         if self._lift_uses_contact_only():
             return
         if not self._refresh_attachment_runtime_available():
@@ -2581,12 +2432,12 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 )
 
     def _detach_overloaded_attachments(self) -> None:
+        if self._curriculum_phase == "lift":
+            return
         if not self._refresh_attachment_runtime_available():
             return
         overload_limit = float(self.cfg.contact_force_overload_n)
         allow_detach_mask = torch.ones(self._num_envs, dtype=torch.bool, device=self._device)
-        if self._curriculum_phase == "lift":
-            allow_detach_mask = self._lift_settle_baseline_captured.clone()
         for agent_name in self.possible_agents:
             attached_mask = self._attachment_mask_for_agent(agent_name) & allow_detach_mask
             if not torch.any(attached_mask):
@@ -2827,7 +2678,10 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         payload_z = self._safe_root_state(self._payload_entity)[:, 2]
         adjusted_goal_xy = self._goal_xy + self._residual_goal_offset
         goal_dist = torch.linalg.vector_norm(payload_xy - adjusted_goal_xy, dim=1)
+        lift_only_phase = self._curriculum_phase == "lift"
         goal_bonus = 0.02 * (1.0 - torch.tanh(goal_dist))
+        if lift_only_phase:
+            goal_bonus = torch.zeros_like(goal_bonus)
         lift_phase_id = int(PHASE_TO_ID[Phase.LIFT])
         in_lift_mask = self._phase_mgr.phase_ids == lift_phase_id
         lift_delta_z, lift_ready_mask = self._lift_progress_state(payload_z)
@@ -2843,6 +2697,8 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
         if self._attachment_runtime_available and (not self._lift_uses_contact_only()):
             current_all_attached = self._attachment_counts() >= int(self.cfg.num_robots)
         team_attach_bonus = 0.01 * current_all_attached.to(dtype=torch.float32)
+        if lift_only_phase:
+            team_attach_bonus = torch.zeros_like(team_attach_bonus)
         contact_force_stack = torch.stack([self._contact_force_cache[name] for name in self.possible_agents], dim=1)
         in_probe_mask = self._phase_mgr.phase_ids == int(PHASE_TO_ID[Phase.PROBE])
         balance_bonus = 0.003 * in_probe_mask.to(dtype=torch.float32) * (
@@ -2852,6 +2708,8 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 / float(max(1.0e-6, self.cfg.contact_force_balance_std_n))
             )
         )
+        if lift_only_phase:
+            balance_bonus = torch.zeros_like(balance_bonus)
         self._update_log_extras(
             payload_z=payload_z,
             lift_delta_z=lift_delta_z,
@@ -2872,12 +2730,17 @@ class NoVlmCoopTransportDirectEnv(DirectMARLEnv):
                 force_n = self._safe_contact_force_norm(self._robot_entities[name])
             contact_bonus = 0.004 * (force_n >= float(self.cfg.contact_force_threshold_n)).to(dtype=torch.float32)
             attach_bonus = 0.006 * self._attachment_mask_for_agent(name).to(dtype=torch.float32)
-            if self._lift_uses_contact_only():
+            if self._lift_uses_contact_only() or lift_only_phase:
                 attach_bonus = torch.zeros_like(attach_bonus)
             overload_pen = 0.002 * torch.relu(force_n - overload_limit)
+            if lift_only_phase:
+                contact_bonus = torch.zeros_like(contact_bonus)
+                overload_pen = torch.zeros_like(overload_pen)
             cbf_pen = 0.002 * self._cbf_slack[:, agent_idx]
             intervention_pen = 0.001 * self._cbf_applied[:, agent_idx].to(dtype=torch.float32)
             belief_bonus = 0.002 * (1.0 - torch.tanh(self._belief_uncertainty[:, 0]))
+            if lift_only_phase:
+                belief_bonus = torch.zeros_like(belief_bonus)
             rewards[name] = (
                 -0.01
                 - control_pen

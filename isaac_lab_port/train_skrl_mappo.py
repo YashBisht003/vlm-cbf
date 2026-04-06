@@ -40,9 +40,6 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Index into the lift payload mass schedule (default 0 -> 6 kg).",
     )
-    parser.add_argument("--lift-preshape-joint2", type=float, default=None, help="Optional lift preshape override for panda_joint2.")
-    parser.add_argument("--lift-preshape-joint4", type=float, default=None, help="Optional lift preshape override for panda_joint4.")
-    parser.add_argument("--lift-preshape-joint6", type=float, default=None, help="Optional lift preshape override for panda_joint6.")
     parser.add_argument("--lift-arm-stiffness", type=float, default=None, help="Optional lift-stage arm stiffness override.")
     parser.add_argument("--lift-arm-damping", type=float, default=None, help="Optional lift-stage arm damping override.")
     parser.add_argument("--print-only", action="store_true", help="Print resolved setup and exit.")
@@ -145,12 +142,6 @@ def _build_official_command(task_id: str, args: argparse.Namespace | None = None
         cmd.extend(["--curriculum_phase", str(args.curriculum_phase)])
     if getattr(args, "lift_mass_level", None) is not None:
         cmd.extend(["--lift_mass_level", str(int(args.lift_mass_level))])
-    if getattr(args, "lift_preshape_joint2", None) is not None:
-        cmd.extend(["--lift_preshape_joint2", str(float(args.lift_preshape_joint2))])
-    if getattr(args, "lift_preshape_joint4", None) is not None:
-        cmd.extend(["--lift_preshape_joint4", str(float(args.lift_preshape_joint4))])
-    if getattr(args, "lift_preshape_joint6", None) is not None:
-        cmd.extend(["--lift_preshape_joint6", str(float(args.lift_preshape_joint6))])
     if getattr(args, "lift_arm_stiffness", None) is not None:
         cmd.extend(["--lift_arm_stiffness", str(float(args.lift_arm_stiffness))])
     if getattr(args, "lift_arm_damping", None) is not None:
@@ -184,9 +175,6 @@ def _build_env_cfg(
     curriculum_phase: str,
     device: str,
     lift_mass_level: int,
-    lift_preshape_joint2: float | None = None,
-    lift_preshape_joint4: float | None = None,
-    lift_preshape_joint6: float | None = None,
     lift_arm_stiffness: float | None = None,
     lift_arm_damping: float | None = None,
 ):
@@ -203,12 +191,6 @@ def _build_env_cfg(
         curriculum_phase=str(curriculum_phase).strip().lower(),
         lift_payload_mass_level=int(lift_mass_level),
     )
-    if lift_preshape_joint2 is not None:
-        cfg.lift_preshape_joint2_rad = float(lift_preshape_joint2)
-    if lift_preshape_joint4 is not None:
-        cfg.lift_preshape_joint4_rad = float(lift_preshape_joint4)
-    if lift_preshape_joint6 is not None:
-        cfg.lift_preshape_joint6_rad = float(lift_preshape_joint6)
     if lift_arm_stiffness is not None:
         cfg.lift_arm_stiffness = float(lift_arm_stiffness)
     if lift_arm_damping is not None:
@@ -797,9 +779,6 @@ def main() -> None:
         "video_interval": int(args.video_interval),
         "curriculum_phase": str(args.curriculum_phase),
         "lift_mass_level": int(args.lift_mass_level),
-        "lift_preshape_joint2": args.lift_preshape_joint2,
-        "lift_preshape_joint4": args.lift_preshape_joint4,
-        "lift_preshape_joint6": args.lift_preshape_joint6,
         "lift_arm_stiffness": args.lift_arm_stiffness,
         "lift_arm_damping": args.lift_arm_damping,
         "official_train_command": " ".join(official_cmd),
@@ -846,9 +825,6 @@ def main() -> None:
             curriculum_phase=str(args.curriculum_phase),
             device=str(args.device),
             lift_mass_level=int(args.lift_mass_level),
-            lift_preshape_joint2=args.lift_preshape_joint2,
-            lift_preshape_joint4=args.lift_preshape_joint4,
-            lift_preshape_joint6=args.lift_preshape_joint6,
             lift_arm_stiffness=args.lift_arm_stiffness,
             lift_arm_damping=args.lift_arm_damping,
         )
